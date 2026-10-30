@@ -5,6 +5,10 @@
 // Baseline: EnergyMeter 5.58 behavior, cleaned source commit 0c874d3 (5.59).
 // Boiler v4.01: 1.3-inch SH1106 variant of v4.00, based on CommonPlatform v1.05.
 // SH1106 1.3-inch 128x64; shared network, OTA and recovery are preserved.
+// OLED hardware map for these installations (128x64 I2C):
+//   OLED_TYPE 3 = CH1116 1.54-inch; U8g2 SSD1309 init (tested on the user's panel).
+//   OLED_TYPE 2 = SSD1309 1.3-inch; OLED_TYPE 1 = legacy SH1106; 0 = none.
+// Existing releases keep their original OLED_TYPE, version and OTA identity.
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
@@ -54,6 +58,9 @@
 #elif OLED_TYPE == 2
 #define OLED_ID "SSD1309"
 #define OTA_PROFILE_ID OTA_PROFILE_PREFIX "-ssd1309"
+#elif OLED_TYPE == 3
+#define OLED_ID "CH1116"
+#define OTA_PROFILE_ID OTA_PROFILE_PREFIX "-ch1116"
 #elif OLED_TYPE == 0
 #define OLED_ID "NONE"
 #define OTA_PROFILE_ID OTA_PROFILE_PREFIX "-none"
@@ -271,14 +278,14 @@ int platformResolveHost(const char* hostname, IPAddress& result, uint32_t timeou
 // END APPLICATION DECLARATIONS
 
 // Display backend for the generated, single-translation-unit firmware sketch.
-// OLED_TYPE: 1 = SH1106, 2 = SSD1309, 0 = no physical display.
+// OLED_TYPE: 1=legacy SH1106, 2=SSD1309 1.3-inch, 3=CH1116 1.54-inch (SSD1309 init), 0=headless.
 // No U8g2 code or framebuffer is included in a headless build.
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 
 #ifndef OLED_TYPE
-  #error "Set OLED_TYPE to 1 (SH1106), 2 (SSD1309) or 0 (no display) in the device profile"
+  #error "Set OLED_TYPE to 1 (legacy SH1106), 2 (SSD1309), 3 (CH1116) or 0 (headless)"
 #endif
 
 enum class DisplayFont : uint8_t {
@@ -288,7 +295,7 @@ enum class DisplayFont : uint8_t {
     Normal10
 };
 
-#if OLED_TYPE == 1 || OLED_TYPE == 2
+#if OLED_TYPE == 1 || OLED_TYPE == 2 || OLED_TYPE == 3
   #include <U8g2lib.h>
 
 class PlatformDisplay {
@@ -345,7 +352,7 @@ public:
 };
 
 #else
-  #error "Invalid OLED_TYPE: use 1 (SH1106), 2 (SSD1309) or 0 (no display)"
+  #error "Invalid OLED_TYPE: use 1 (SH1106), 2 (SSD1309), 3 (CH1116) or 0 (headless)"
 #endif
 
 static PlatformDisplay platformDisplay;
@@ -4982,7 +4989,7 @@ void platformInitializeDisplay() {
     bootCheckpoint(CRASH_STAGE_BOOT_OLED_INIT);
     platformDisplay.begin();
     bootOledReady = true;
-#if OLED_TYPE == 2
+#if OLED_TYPE == 2 || OLED_TYPE == 3
     platformDisplay.contrast(255);
 #endif
 }
