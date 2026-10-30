@@ -3,7 +3,9 @@
 // Application generation inserts only the selected application's declarations,
 // implementation and profile at the marked integration points below.
 // Baseline: EnergyMeter 5.58 behavior, cleaned source commit 0c874d3 (5.59).
-// Boiler v4.00: regenerated from Boiler v3.05 against CommonPlatform v1.05.\n// Shared network, OTA, credentials, platform and recovery code stays compatible.\n// BEGIN PLATFORM PROFILE
+// Boiler v4.00: integrated from Boiler v3.05 and CommonPlatform v1.05.
+// SSD1309 1.54-inch 128x64 display; shared network, OTA and recovery are preserved.
+// BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
 #define PLATFORM_VERSION "1.05"
@@ -17,7 +19,7 @@
 #define OTA_PROFILE_PREFIX "esp32c3-boiler-4ds18b20"
 #define MQTT_TOPIC_PREFIX "home/energy/"
 #ifndef OLED_TYPE
-#define OLED_TYPE 1  // SH1106; set 0 temporarily for a headless AP isolation test.
+#define OLED_TYPE 2  // SSD1309, 1.54-inch 128x64 I2C OLED; GPIO3 SDA, GPIO4 SCL.
 #endif
 #define PLATFORM_OTA_FILENAME_PREFIX "Boiler_ESP32C3_V"
 #define PLATFORM_OTA_FILENAME_SUFFIX ".bin"
