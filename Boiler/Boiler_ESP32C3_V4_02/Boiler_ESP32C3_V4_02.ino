@@ -5,8 +5,12 @@
 // Baseline: EnergyMeter 5.58 behavior, cleaned source commit 0c874d3 (5.59).
 // Boiler v4.02 CH1116 display experiment, based on v4.01 / CommonPlatform v1.05.
 // U8g2 has no native CH1116 constructor; this alternate test uses SSD1309 init.
-// Older v4.01 used SH1106 init. CH1116 hardware compatibility is NOT verified.
-// 1.3-inch 128x64, GPIO3 SDA / GPIO4 SCL; preserve OTA and recovery services.
+// Older v4.01 used SH1106 init. CH1116 + SSD1309 initialization is confirmed on the user's panel.
+// 1.54-inch CH1116 128x64, GPIO3 SDA / GPIO4 SCL; preserve OTA and recovery services.
+// OLED hardware map for these installations (128x64 I2C):
+//   OLED_TYPE 3 = CH1116 1.54-inch; U8g2 SSD1309 init (tested on the user's panel).
+//   OLED_TYPE 2 = SSD1309 1.3-inch; OLED_TYPE 1 = legacy SH1106; 0 = none.
+// Existing releases keep their original OLED_TYPE, version and OTA identity.
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
@@ -21,7 +25,7 @@
 #define OTA_PROFILE_PREFIX "esp32c3-boiler-4ds18b20"
 #define MQTT_TOPIC_PREFIX "home/energy/"
 #ifndef OLED_TYPE
-#define OLED_TYPE 3  // CH1116 experiment: SSD1309-compatible init, 1.3-inch I2C 128x64.
+#define OLED_TYPE 3  // CH1116 1.54-inch 128x64 I2C; SSD1309-compatible init.
 #endif
 #define PLATFORM_OTA_FILENAME_PREFIX "Boiler_ESP32C3_V"
 #define PLATFORM_OTA_FILENAME_SUFFIX ".bin"
@@ -276,7 +280,7 @@ int platformResolveHost(const char* hostname, IPAddress& result, uint32_t timeou
 // END APPLICATION DECLARATIONS
 
 // Display backend for the generated, single-translation-unit firmware sketch.
-// OLED_TYPE: 1 = SH1106, 2 = SSD1309, 3 = CH1116 trial (SSD1309 init), 0 = headless.
+// OLED_TYPE: 1=legacy SH1106, 2=SSD1309 1.3-inch, 3=CH1116 1.54-inch (SSD1309 init), 0=headless.
 // No U8g2 code or framebuffer is included in a headless build.
 #include <stdint.h>
 #include <stdarg.h>
