@@ -10,8 +10,8 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.05"
-#define VERSION "1.05"
+#define PLATFORM_VERSION "1.06"
+#define VERSION "1.06"
 #define BUILD_DATE "28/10/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
@@ -89,7 +89,21 @@
 
 #define PLATFORM_STRINGIFY_INNER(value) #value
 #define PLATFORM_STRINGIFY(value) PLATFORM_STRINGIFY_INNER(value)
-#define PLATFORM_SETUP_IP_TEXT "192.168.1.79"
+// Configuration shared by AP+STA fallback and the manual setup portal.
+// Keep the AP on a different /24 from the router LAN (192.168.1.x).
+#ifndef PLATFORM_SETUP_IP_A
+#define PLATFORM_SETUP_IP_A 192
+#endif
+#ifndef PLATFORM_SETUP_IP_B
+#define PLATFORM_SETUP_IP_B 168
+#endif
+#ifndef PLATFORM_SETUP_IP_C
+#define PLATFORM_SETUP_IP_C 2
+#endif
+#ifndef PLATFORM_SETUP_IP_D
+#define PLATFORM_SETUP_IP_D 2
+#endif
+#define PLATFORM_SETUP_IP_TEXT PLATFORM_STRINGIFY(PLATFORM_SETUP_IP_A) "." PLATFORM_STRINGIFY(PLATFORM_SETUP_IP_B) "." PLATFORM_STRINGIFY(PLATFORM_SETUP_IP_C) "." PLATFORM_STRINGIFY(PLATFORM_SETUP_IP_D)
 #define PLATFORM_SETUP_BASE_URL "http://" PLATFORM_SETUP_IP_TEXT "/"
 
 #include <Arduino.h>
@@ -936,9 +950,17 @@ bool credentialRestartPending = false;
 unsigned long credentialRestartRequestedMs = 0;
 unsigned long wifiOfflineSinceMs = 0;
 const unsigned long CREDENTIAL_RESTART_DELAY_MS = 1200UL;
-const unsigned long WIFI_RETRY_STEPS_MS[] = {1500UL};
+// Initial attempts are one minute apart (start-to-start).
+const unsigned long WIFI_RETRY_STEPS_MS[] = {60000UL};
 const unsigned long WIFI_ATTEMPT_TIMEOUT_MS = 15000UL;
 const uint8_t WIFI_MAX_FAILED_ATTEMPTS = 3;
+// Automatic fallback leaves AP available while STA retries indefinitely.
+const unsigned long WIFI_FALLBACK_RETRY_STEPS_MS[] = {
+    120000UL, 240000UL, 480000UL, 900000UL, 1800000UL
+};
+const uint8_t WIFI_FALLBACK_RETRY_STEP_COUNT =
+    sizeof(WIFI_FALLBACK_RETRY_STEPS_MS) / sizeof(WIFI_FALLBACK_RETRY_STEPS_MS[0]);
+const unsigned long WIFI_FALLBACK_STABLE_MS = 10000UL;
 uint8_t wifiConsecutiveFailures = 0;
 uint32_t wifiFailedAttempts = 0;
 bool wifiAttemptActive = false;
@@ -946,6 +968,10 @@ unsigned long wifiAttemptStartedMs = 0;
 bool wifiAttemptFailedEvent = false;
 uint16_t wifiAttemptEventReason = 0;
 bool wifiFallbackActive = false;
+uint8_t wifiFallbackRetryStep = 0;
+uint32_t wifiFallbackRetries = 0;
+unsigned long wifiFallbackLastRetryMs = 0;
+unsigned long wifiStationConnectedSinceMs = 0;
 uint16_t wifiFallbackReason = 0;
 int wifiFallbackStatus = 0;
 uint8_t wifiFallbackFailureKind = 0; // 1=disconnect, 2=timeout, 3=radio, 4=IP, 5=begin
@@ -1733,7 +1759,7 @@ const char* apFailureDescription(uint8_t code) {
 }
 
 const char* networkOperationDescription() {
-    if (credentialPortalOnly && wifiFallbackActive) return PSTR("Setup AP reopened after 3 failed router Wi-Fi attempts; edit Wi-Fi or IP settings");
+    if (credentialPortalOnly && wifiFallbackActive) return PSTR("Setup AP stays open with AP+STA background retries; check Wi-Fi or IP settings");
     if (credentialPortalOnly) return PSTR("AP-only setup: router Wi-Fi and MQTT are intentionally paused");
     if (recoveryMode) return PSTR("OTA-only recovery: MQTT measurements are paused");
     if (WiFi.status() != WL_CONNECTED) return PSTR("Waiting for the router Wi-Fi connection before MQTT can connect");
@@ -2832,12 +2858,13 @@ bool writeWifiFallbackNotice(WiFiClient& client) {
     if (!wifiFallbackActive) return true;
     if (!writeCredentialProgmem(client, PSTR(
         "<div class='card' role='alert'><h2>Δεν μπορώ να συνδεθώ στο Wi-Fi</h2>"
-        "<p>Απέτυχαν 3 προσπάθειες σύνδεσης. Το Access Point παραμένει ανοικτό για διόρθωση των ρυθμίσεων.</p><p>Αιτία: <b>"))) return false;
+        "<p>Απέτυχαν 3 αρχικές προσπάθειες σύνδεσης. Το Access Point παραμένει ανοικτό ενώ το Wi-Fi συνεχίζει τις αυτόματες επανασυνδέσεις.</p><p>Αιτία: <b>"))) return false;
     if (!writeCredentialProgmem(client, wifiFailureExplanation())) return false;
     char detail[128];
     int n = snprintf(detail, sizeof(detail),
-        "</b></p><p>SDK reason: %u · Wi-Fi status: %d · Failed attempts: 3/3</p></div>",
-        (unsigned)wifiFallbackReason, wifiFallbackStatus);
+        "</b></p><p>SDK reason: %u · Wi-Fi status: %d · Background retries: %lu</p></div>",
+        (unsigned)wifiFallbackReason, wifiFallbackStatus,
+        (unsigned long)wifiFallbackRetries);
     return n > 0 && n < (int)sizeof(detail) &&
         writeRootBytes(client, reinterpret_cast<const uint8_t*>(detail), (size_t)n);
 }
@@ -2993,7 +3020,7 @@ void handleCredentialSave() {
         "<!doctype html><html><body><h2>Saved</h2>"
         "<p>Saved and read-back verified. Restarting with the stored Wi-Fi settings.</p>"
         "<p>After connecting to the router, open <a href='http://192.168.1.%u/'>http://192.168.1.%u/</a>.</p>"
-        "<p>After 3 failed Wi-Fi attempts, reconnect to the setup AP at " PLATFORM_SETUP_BASE_URL ".</p>"
+        "<p>After 3 failed Wi-Fi attempts, use the setup AP at " PLATFORM_SETUP_BASE_URL " while background STA retries continue.</p>"
         "<p>MQTT rejection will not erase settings or disable router Wi-Fi.</p></body></html>",
         (unsigned)selectedOctet, (unsigned)selectedOctet);
     server.send(200, "text/html; charset=utf-8", reply);
@@ -3259,10 +3286,12 @@ void handleNetworkDebugPage() {
 
     n = snprintf_P(line, sizeof(line), PSTR("Boot checkpoints: %s\nLast boot CP: %s (%lu)\n"
         "Wi-Fi attempts: %lu\nWi-Fi retry delay ms: %lu\n"
-        "Offline policy: LOCAL SERVICE + SETUP AP AFTER 3 FAILED WI-FI ATTEMPTS\n"),
+        "Offline policy: LOCAL SERVICE + AP+STA FALLBACK WITH INDEFINITE RETRIES\n"),
         bootCheckpointsActive ? "ACTIVE" : "DONE",
         crashStageLabel(bootLastCheckpoint), (unsigned long)bootLastCheckpoint,
-        (unsigned long)wifiConnectAttempts, WIFI_RETRY_STEPS_MS[wifiRetryStep]);
+        (unsigned long)wifiConnectAttempts,
+        wifiFallbackActive ? WIFI_FALLBACK_RETRY_STEPS_MS[wifiFallbackRetryStep]
+                           : WIFI_RETRY_STEPS_MS[wifiRetryStep]);
     if (n <= 0 || n >= (int)sizeof(line)) return;
     if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
 
@@ -3310,7 +3339,7 @@ void handleNetworkDebugPage() {
         PLATFORM_REQUIRE_ROUTER_BEFORE_APPLICATION ? "ROUTER FIRST" : "LOCAL FIRST",
         normalMeterInitialized ? "YES" : "NO", bootOledReady ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
-    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nFallback AP: %s\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
+    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nFallback AP: %s; background retries: %lu\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO", (unsigned long)wifiFallbackRetries);
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
     if (wifiFallbackActive) {
         if (!writeCredentialProgmem(client, wifiFailureExplanation()) || !writeCredentialProgmem(client, PSTR("\n"))) return;
@@ -3506,9 +3535,11 @@ void configureCredentialRoutes() {
 }
 
 bool configureSetupApAddress() {
-    const IPAddress setupIp(192, 168, 1, 79);
+    const IPAddress setupIp(PLATFORM_SETUP_IP_A, PLATFORM_SETUP_IP_B,
+                            PLATFORM_SETUP_IP_C, PLATFORM_SETUP_IP_D);
     const IPAddress setupMask(255, 255, 255, 0);
-    const IPAddress leaseStart(192, 168, 1, 80);
+    const IPAddress leaseStart(PLATFORM_SETUP_IP_A, PLATFORM_SETUP_IP_B,
+                               PLATFORM_SETUP_IP_C, 80);
     // Core 3.3.12 supports an explicit DHCP lease start and validates that the
     // AP/gateway are outside the pool (.2-.12), using native esp_netif APIs.
     return WiFi.softAPConfig(setupIp, setupIp, setupMask, leaseStart, setupIp) &&
@@ -3535,7 +3566,7 @@ bool platformReadSetupApState() {
         actualLength != ssidLength ||
         memcmp(config.ap.ssid, credentialApName.c_str(), ssidLength) != 0 ||
         config.ap.ssid_hidden != 0 || config.ap.authmode != WIFI_AUTH_OPEN ||
-        config.ap.channel != CREDENTIAL_AP_CHANNEL) {
+        (config.ap.channel != CREDENTIAL_AP_CHANNEL && WiFi.getMode() != WIFI_AP_STA)) {
         credentialApLastNativeError = ESP_ERR_INVALID_STATE;
         return false;
     }
@@ -3554,7 +3585,8 @@ bool platformReadSetupApState() {
     if (credentialApLastNativeError != ESP_OK) return false;
     credentialApBandwidth = (uint8_t)bandwidth;
     credentialApLastCheckStage = 18;
-    if (WiFi.softAPIP() != IPAddress(192, 168, 1, 79)) {
+    if (WiFi.softAPIP() != IPAddress(PLATFORM_SETUP_IP_A, PLATFORM_SETUP_IP_B,
+                                         PLATFORM_SETUP_IP_C, PLATFORM_SETUP_IP_D)) {
         credentialApLastNativeError = ESP_ERR_INVALID_STATE;
         return false;
     }
@@ -3595,8 +3627,10 @@ bool platformStartSetupApRadio() {
     // In particular, softAPdisconnect() on an OFF C3 would first start an AP.
     WiFi.persistent(false);
     credentialApLastCheckStage = 2;
-    if (WiFi.getMode() != WIFI_AP) {
-        if (!WiFi.mode(WIFI_AP)) {
+    // Keep STA running in automatic fallback; manual setup stays AP-only.
+    const wifi_mode_t desiredMode = wifiFallbackActive ? WIFI_AP_STA : WIFI_AP;
+    if (WiFi.getMode() != desiredMode) {
+        if (!WiFi.mode(desiredMode)) {
             credentialApLastNativeError = ESP_FAIL;
             return false;
         }
@@ -3719,14 +3753,14 @@ void serviceCredentialApHealth(unsigned long now) {
 
 void stopCredentialAccessPoint() {
     if (!credentialPortalActive || credentialPortalOnly) return;
+    // Switching AP+STA to STA stops only AP, preserving the router connection.
+    if (!WiFi.mode(WIFI_STA)) return;
     credentialDns.stop();
-    WiFi.softAPdisconnect(true);
     credentialPortalActive = false;
     credentialApStateVerified = false;
     resetApWebSession();
     credentialApName = "";
     credentialApPassword = "";
-    if (WiFi.status() == WL_CONNECTED) WiFi.mode(WIFI_STA);
 }
 
 // Save/clear can be requested over LAN, AP or Recovery, including failed AP starts.
@@ -3925,7 +3959,9 @@ void servicePendingWiFiDisconnect() {
     const uint16_t reason = pendingWiFiDisconnectReason;
     wifiDisconnectPending = false;
     portEXIT_CRITICAL(&wifiEventMux);
-    if (!pending || credentialPortalOnly || WiFi.getMode() != WIFI_STA ||
+    const wifi_mode_t mode = WiFi.getMode();
+    if (!pending || (credentialPortalOnly && !wifiFallbackActive) ||
+        (mode != WIFI_STA && mode != WIFI_AP_STA) ||
         reason == WIFI_REASON_AUTH_LEAVE || reason == WIFI_REASON_ASSOC_LEAVE) return;
     wifiLastDisconnectReason = reason;
     if (wifiAttemptActive && !wifiAttemptFailedEvent) {
@@ -3937,12 +3973,17 @@ void servicePendingWiFiDisconnect() {
 void enterWiFiFallback() {
     wifiAttemptActive = false;
     wifiFallbackActive = true;
+    wifiFallbackRetryStep = 0;
+    wifiFallbackRetries = 0;
+    wifiFallbackLastRetryMs = millis();
+    wifiStationConnectedSinceMs = 0;
     wifiWasConnected = false;
     mqttNet.stop();
     server.stop();
     networkServicesStarted = false;
     if (recoveryMode) configureRecoveryRoutes();
     else configureWebRoutes();
+    // Fallback AP coexists with STA while all subsequent retries take place.
     startCredentialAccessPoint(true);
 }
 
@@ -3955,14 +3996,17 @@ void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     wifiFallbackFailureKind = kind;
     wifiFallbackReason = reason;
     wifiFallbackStatus = status;
-    lastWifiRetry = millis();
-    if (wifiConsecutiveFailures >= WIFI_MAX_FAILED_ATTEMPTS) enterWiFiFallback();
+    // lastWifiRetry is the attempt start, so the 60-second interval is exact.
+    if (!wifiFallbackActive && wifiConsecutiveFailures >= WIFI_MAX_FAILED_ATTEMPTS)
+        enterWiFiFallback();
 }
 
 void startTrackedWiFiAttempt() {
-    if (credentialPortalOnly || !ssid[0]) return;
+    if ((credentialPortalOnly && !wifiFallbackActive) || !ssid[0]) return;
     WiFi.persistent(false);
-    if (WiFi.getMode() == WIFI_STA) WiFi.disconnect(false);
+    // Disconnect station only; never tear down the fallback AP.
+    const wifi_mode_t currentMode = WiFi.getMode();
+    if (currentMode == WIFI_STA || currentMode == WIFI_AP_STA) WiFi.disconnect(false);
     portENTER_CRITICAL(&wifiEventMux);
     wifiDisconnectPending = false;
     pendingWiFiDisconnectReason = 0;
@@ -3973,7 +4017,8 @@ void startTrackedWiFiAttempt() {
     wifiAttemptStartedMs = millis();
     lastWifiRetry = wifiAttemptStartedMs;
     ++wifiConnectAttempts;
-    if (WiFi.getMode() != WIFI_STA && !WiFi.mode(WIFI_STA)) {
+    const wifi_mode_t requiredMode = wifiFallbackActive ? WIFI_AP_STA : WIFI_STA;
+    if (WiFi.getMode() != requiredMode && !WiFi.mode(requiredMode)) {
         finishWiFiAttemptFailure(3, 0, (int)WiFi.status());
         return;
     }
@@ -3996,6 +4041,10 @@ void connectWiFiInitial(bool waitForConnection) {
     }
     wifiConsecutiveFailures = 0;
     wifiRetryStep = 0;
+    wifiFallbackActive = false;
+    wifiFallbackRetryStep = 0;
+    wifiFallbackRetries = 0;
+    wifiStationConnectedSinceMs = 0;
     wifiWasConnected = false;
     wifiAttemptActive = false;
     startTrackedWiFiAttempt();
@@ -4035,8 +4084,31 @@ bool serviceNetworkStackRecovery(unsigned long now) {
 
 void serviceWiFiReconnect(unsigned long now) {
     servicePendingWiFiDisconnect();
-    if (credentialPortalOnly || !ssid[0]) return;
-    if (WiFi.status() == WL_CONNECTED) {
+    if ((credentialPortalOnly && !wifiFallbackActive) || !ssid[0]) return;
+
+    const bool staReady = WiFi.status() == WL_CONNECTED &&
+                          WiFi.localIP() != IPAddress(0, 0, 0, 0);
+    if (staReady) {
+        if (!wifiStationConnectedSinceMs) wifiStationConnectedSinceMs = now;
+        if (wifiFallbackActive) {
+            // Do not close setup AP until a usable STA IP remains stable for 10 s.
+            wifiAttemptActive = false;
+            wifiAttemptFailedEvent = false;
+            if ((uint32_t)(now - wifiStationConnectedSinceMs) < WIFI_FALLBACK_STABLE_MS)
+                return;
+            // Recovery OTA transfers must not be cut off mid-upload.
+            if (recoveryOtaInProgress) return;
+            credentialPortalOnly = false;
+            if (credentialPortalActive) stopCredentialAccessPoint();
+            else if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
+            if (credentialPortalActive || WiFi.getMode() != WIFI_STA ||
+                WiFi.status() != WL_CONNECTED) {
+                credentialPortalOnly = true;
+                wifiStationConnectedSinceMs = 0;
+                if (!credentialPortalActive) startCredentialAccessPoint(true);
+                return;
+            }
+        }
         if (!wifiWasConnected) {
             lastMqttReconnectMs = 0;
             mqttRetryStep = 0;
@@ -4047,6 +4119,8 @@ void serviceWiFiReconnect(unsigned long now) {
         wifiAttemptFailedEvent = false;
         wifiConsecutiveFailures = 0;
         wifiFallbackActive = false;
+        wifiFallbackRetryStep = 0;
+        wifiFallbackRetries = 0;
         wifiFallbackFailureKind = 0;
         wifiFallbackReason = 0;
         wifiRetryStep = 0;
@@ -4054,6 +4128,7 @@ void serviceWiFiReconnect(unsigned long now) {
         wifiLastDisconnectReason = 0;
         return;
     }
+    wifiStationConnectedSinceMs = 0;
     if (wifiWasConnected) {
         wifiWasConnected = false;
         mqttNet.stop();
@@ -4068,6 +4143,17 @@ void serviceWiFiReconnect(unsigned long now) {
             finishWiFiAttemptFailure(1, wifiAttemptEventReason, (int)WiFi.status());
         } else if ((uint32_t)(now - wifiAttemptStartedMs) >= WIFI_ATTEMPT_TIMEOUT_MS) {
             finishWiFiAttemptFailure(2, 0, (int)WiFi.status());
+        }
+        return;
+    }
+    if (wifiFallbackActive) {
+        const unsigned long delayMs = WIFI_FALLBACK_RETRY_STEPS_MS[wifiFallbackRetryStep];
+        if ((uint32_t)(now - wifiFallbackLastRetryMs) >= delayMs) {
+            wifiFallbackLastRetryMs = now;
+            ++wifiFallbackRetries;
+            if (wifiFallbackRetryStep + 1 < WIFI_FALLBACK_RETRY_STEP_COUNT)
+                ++wifiFallbackRetryStep;
+            startTrackedWiFiAttempt();
         }
         return;
     }
@@ -4153,7 +4239,7 @@ void serviceFlashSetupButton(unsigned long now) {
     if (credentialPortalOnly) {
         exitManualSetupAccessPoint();
     } else {
-        // Setup deliberately pauses STA/MQTT; its AP remains 192.168.1.79.
+        // Manual setup pauses STA/MQTT; automatic fallback instead runs AP+STA.
         // Local reads/accounting remain enabled; saved credentials are untouched.
         mqttNet.stop();
         wifiWasConnected = false;
