@@ -11,7 +11,7 @@
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
 #define PLATFORM_VERSION "1.06"
-#define VERSION "1.05"
+#define VERSION "1.06"
 #define BUILD_DATE "28/10/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
