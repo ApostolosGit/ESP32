@@ -95,7 +95,7 @@
 
 #define PLATFORM_STRINGIFY_INNER(value) #value
 #define PLATFORM_STRINGIFY(value) PLATFORM_STRINGIFY_INNER(value)
-#define PLATFORM_SETUP_IP_TEXT "192.168.1.79"
+#define PLATFORM_SETUP_IP_TEXT "192.168.2.XX"
 #define PLATFORM_SETUP_BASE_URL "http://" PLATFORM_SETUP_IP_TEXT "/"
 
 #include <Arduino.h>
@@ -2971,7 +2971,7 @@ void handleCredentialSetupPage() {
     if (!writeCredentialHtmlEscaped(client, octetText)) return;
     if (!writeCredentialProgmem(client, PSTR(
         "'><small>Προεπιλογή εφαρμογής: 192.168.1." PLATFORM_STRINGIFY(SITE_IP_D)
-        ". Το AP ανοίγει πάντα στο " PLATFORM_SETUP_IP_TEXT ".</small>"
+        ". Το AP ανοίγει στο 192.168.2.XX (XX = LAN IP).</small>"
         "<label>MQTT username</label><input name='mqtt_user' maxlength='64' value='"))) return;
     if (haveStored && !writeCredentialHtmlEscaped(client, stored.mqttUser)) return;
 
@@ -3055,7 +3055,7 @@ void handleCredentialSave() {
         "<!doctype html><html><body><h2>Saved</h2>"
         "<p>Saved and read-back verified. Restarting with the stored Wi-Fi settings.</p>"
         "<p>After connecting to the router, open <a href='http://192.168.1.%u/'>http://192.168.1.%u/</a>.</p>"
-        "<p>After 3 failed Wi-Fi attempts, reconnect to the setup AP at " PLATFORM_SETUP_BASE_URL ".</p>"
+        "<p>After 3 failed Wi-Fi attempts, the recovery AP opens at 192.168.2.XX (XX = saved LAN last octet), with ongoing Wi-Fi retries.</p>"
         "<p>MQTT rejection will not erase settings or disable router Wi-Fi.</p></body></html>",
         (unsigned)selectedOctet, (unsigned)selectedOctet);
     server.send(200, "text/html; charset=utf-8", reply);
@@ -3583,12 +3583,17 @@ void configureCredentialRoutes() {
     credentialRoutesConfigured = true;
 }
 
+IPAddress platformSetupApAddress() {
+    // E.g. STA 192.168.1.82 -> fallback/manual AP 192.168.2.82.
+    return IPAddress(192, 168, 2, configuredStaOctet);
+}
 bool configureSetupApAddress() {
-    const IPAddress setupIp(192, 168, 1, 79);
+    const IPAddress setupIp = platformSetupApAddress();
     const IPAddress setupMask(255, 255, 255, 0);
-    const IPAddress leaseStart(192, 168, 1, 80);
-    // Core 3.3.12 supports an explicit DHCP lease start and validates that the
-    // AP/gateway are outside the pool (.2-.12), using native esp_netif APIs.
+    // Keep DHCP leases away from the gateway even for arbitrary XX.
+    const uint8_t leaseOctet = (configuredStaOctet >= 100 && configuredStaOctet < 200)
+                                ? 220 : 100;
+    const IPAddress leaseStart(192, 168, 2, leaseOctet);
     return WiFi.softAPConfig(setupIp, setupIp, setupMask, leaseStart, setupIp) &&
            WiFi.softAPIP() == setupIp;
 }
@@ -3632,7 +3637,7 @@ bool platformReadSetupApState() {
     if (credentialApLastNativeError != ESP_OK) return false;
     credentialApBandwidth = (uint8_t)bandwidth;
     credentialApLastCheckStage = 18;
-    if (WiFi.softAPIP() != IPAddress(192, 168, 1, 79)) {
+    if (WiFi.softAPIP() != platformSetupApAddress()) {
         credentialApLastNativeError = ESP_ERR_INVALID_STATE;
         return false;
     }
@@ -3767,7 +3772,7 @@ void startCredentialAccessPoint(bool portalOnly) {
     doublePrintf(420, 1, 1, "SETUP AP / v%s", VERSION);
     doublePrintf(420, 2, 1, "%s", credentialApName.c_str());
     doublePrintf(420, 3, 1, "WiFi open PIN:%s", AP_WEB_PIN);
-    doublePrintf(420, 4, 1, "Open: " PLATFORM_SETUP_IP_TEXT);
+    doublePrintf(420, 4, 1, "Open: %s", WiFi.softAPIP().toString().c_str());
 }
 
 void serviceCredentialApHealth(unsigned long now) {
@@ -4335,9 +4340,8 @@ void drawWiFiStatusHint(unsigned long now) {
             snprintf(line, sizeof(line), "WiFi open PIN:%s", AP_WEB_PIN);
             platformDisplay.text(0, 44, line);
             platformDisplay.font(DisplayFont::Tiny4x6);
-            platformDisplay.text(0, 60, ssid[0] && password[0]
-                ? PLATFORM_SETUP_IP_TEXT "/setup BOOT:exit"
-                : PLATFORM_SETUP_IP_TEXT "/setup SAVE WiFi");
+            snprintf(line, sizeof(line), "AP: %s", WiFi.softAPIP().toString().c_str());
+            platformDisplay.text(0, 60, line);
         } else {
             platformDisplay.font(DisplayFont::Small5x7);
             snprintf(line, sizeof(line), "Stage:%u err:%ld", (unsigned)credentialApLastCheckStage, (long)credentialApLastNativeError);
