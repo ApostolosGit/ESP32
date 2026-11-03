@@ -1389,7 +1389,8 @@ bool drawOledDiagnostic(unsigned long now) {
         platformDisplay.text(0, 40, credentialApName.c_str());
         snprintf(line, sizeof(line), "WiFi open PIN:%s", AP_WEB_PIN);
         platformDisplay.text(0, 50, line);
-        platformDisplay.text(0, 60, PLATFORM_SETUP_IP_TEXT "/setup");
+        snprintf(line, sizeof(line), "%s/setup", WiFi.softAPIP().toString().c_str());
+        platformDisplay.text(0, 60, line);
     } else {
         if (normalMeterInitialized && !recoveryMode) {
             applicationFormatSummary(line, sizeof(line));
@@ -1792,7 +1793,7 @@ const char* apFailureDescription(uint8_t code) {
 }
 
 const char* networkOperationDescription() {
-    if (credentialPortalOnly && wifiFallbackActive) return PSTR("Setup AP reopened after 3 failed router Wi-Fi attempts; edit Wi-Fi or IP settings");
+    if (wifiFallbackActive && credentialPortalActive) return PSTR("Router offline: temporary AP+STA active; router reconnection continues");
     if (credentialPortalOnly) return PSTR("AP-only setup: router Wi-Fi and MQTT are intentionally paused");
     if (recoveryMode) return PSTR("OTA-only recovery: MQTT measurements are paused");
     if (WiFi.status() != WL_CONNECTED) return PSTR("Waiting for the router Wi-Fi connection before MQTT can connect");
@@ -4395,7 +4396,7 @@ void drawWiFiStatusHint(unsigned long now) {
         }
     } else {
         platformDisplay.font(DisplayFont::Small5x7);
-        platformDisplay.text(0, 12, wifiFailureLabel());
+        platformDisplay.text(0, 12, wifiFallbackActive ? "AP+STA router retry" : wifiFailureLabel());
         const bool checkPassword =
             wifiLastDisconnectReason == WIFI_REASON_AUTH_FAIL ||
             wifiLastDisconnectReason == WIFI_REASON_802_1X_AUTH_FAILED ||
@@ -4407,7 +4408,12 @@ void drawWiFiStatusHint(unsigned long now) {
         const unsigned long remaining = age >= gap ? 0 : gap - age;
         snprintf(line, sizeof(line), "Retry in %lus", (remaining + 999UL) / 1000UL);
         platformDisplay.text(0, 44, line);
-        platformDisplay.text(0, 60, "FLASH: AP setup");
+        if (wifiFallbackActive && credentialPortalActive) {
+            snprintf(line, sizeof(line), "AP: %s", WiFi.softAPIP().toString().c_str());
+            platformDisplay.text(0, 60, line);
+        } else {
+            platformDisplay.text(0, 60, "FLASH: AP setup");
+        }
     }
     platformDisplay.present();
 }
