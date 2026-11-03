@@ -3384,7 +3384,8 @@ void handleNetworkDebugPage() {
     if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
 
     const int txTenths = wifiTxTenths();
-    n = snprintf_P(line, sizeof(line),
+    char txLine[384];
+    n = snprintf_P(txLine, sizeof(txLine),
         PSTR("Wi-Fi RX RSSI: %d dBm (connected only)\n"
              "Wi-Fi TX requested max: %d.%d dBm (not measured)\n"
              "Adaptive TX hard cap: 15.0 dBm\n"
@@ -3394,8 +3395,8 @@ void handleNetworkDebugPage() {
         WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
         txTenths / 10, txTenths % 10, wifiTxLastPreconnectRssi,
         (unsigned long)wifiTxScanCount, (unsigned long)wifiTxApplyFailures);
-    if (n <= 0 || n >= (int)sizeof(line)) return;
-    if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
+    if (n <= 0 || n >= (int)sizeof(txLine)) return;
+    if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(txLine),(size_t)n)) return;
 
     if (WiFi.status() == WL_CONNECTED) {
         IPAddress lip = WiFi.localIP();
