@@ -2894,7 +2894,7 @@ bool writeWifiFallbackNotice(WiFiClient& client) {
     if (!wifiFallbackActive) return true;
     if (!writeCredentialProgmem(client, PSTR(
         "<div class='card' role='alert'><h2>Δεν μπορώ να συνδεθώ στο Wi-Fi</h2>"
-        "<p>Απέτυχαν 3 προσπάθειες σύνδεσης. Το Access Point παραμένει ανοικτό για διόρθωση των ρυθμίσεων.</p><p>Αιτία: <b>"))) return false;
+        "<p>Απέτυχαν 3 προσπάθειες σύνδεσης. Το AP λειτουργεί παράλληλα με τις επανασυνδέσεις και θα κλείσει αυτόματα όταν επιστρέψει ο router.</p><p>Αιτία: <b>"))) return false;
     if (!writeCredentialProgmem(client, wifiFailureExplanation())) return false;
     char detail[128];
     int n = snprintf(detail, sizeof(detail),
@@ -2944,6 +2944,12 @@ void handleCredentialSetupPage() {
         ".card{border:1px solid #dbe3e8;border-radius:12px;padding:14px;margin:12px 0}"
         "</style><style>body{font:22px/1.35 Arial,sans-serif;max-width:760px;margin:auto;padding:10px;color:#142431}h1,h2,small{font-size:inherit}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere}input,button{font:inherit}</style></head><body><h2>" DEVICE_LABEL " v" VERSION " setup</h2>"))) return;
     if (!writeWifiFallbackNotice(client)) return;
+    if (credentialPortalActive) {
+        const String apIpText = WiFi.softAPIP().toString();
+        if (!writeCredentialProgmem(client, PSTR("<p>Setup AP IP: <b>")) ||
+            !writeCredentialHtmlEscaped(client, apIpText.c_str()) ||
+            !writeCredentialProgmem(client, PSTR("</b></p>"))) return;
+    }
 #if PLATFORM_REQUIRE_ROUTER_BEFORE_APPLICATION
     if (!writeCredentialProgmem(client, PSTR(
         "<p>Πρώτα ρυθμίστε και συνδέστε το Wi-Fi του router. Η οθόνη και οι αισθητήρες ξεκινούν μόνο μετά τη σύνδεση. Δεν απαιτείται σύνδεση MQTT.</p>"))) return;
@@ -3055,9 +3061,9 @@ void handleCredentialSave() {
         "<!doctype html><html><body><h2>Saved</h2>"
         "<p>Saved and read-back verified. Restarting with the stored Wi-Fi settings.</p>"
         "<p>After connecting to the router, open <a href='http://192.168.1.%u/'>http://192.168.1.%u/</a>.</p>"
-        "<p>After 3 failed Wi-Fi attempts, the recovery AP opens at 192.168.2.XX (XX = saved LAN last octet), with ongoing Wi-Fi retries.</p>"
+        "<p>After 3 failed Wi-Fi attempts, the temporary AP opens at http://192.168.2.%u/ with ongoing Wi-Fi retries.</p>"
         "<p>MQTT rejection will not erase settings or disable router Wi-Fi.</p></body></html>",
-        (unsigned)selectedOctet, (unsigned)selectedOctet);
+        (unsigned)selectedOctet, (unsigned)selectedOctet, (unsigned)selectedOctet);
     server.send(200, "text/html; charset=utf-8", reply);
     credentialRestartPending = true;
     credentialRestartRequestedMs = millis();
@@ -3372,7 +3378,7 @@ void handleNetworkDebugPage() {
         PLATFORM_REQUIRE_ROUTER_BEFORE_APPLICATION ? "ROUTER FIRST" : "LOCAL FIRST",
         normalMeterInitialized ? "YES" : "NO", bootOledReady ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
-    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nSetup AP active: %s (manual/unprovisioned only)\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
+    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nSetup AP active: %s (automatic after 3 failures or manual)\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
     if (wifiFallbackActive) {
         if (!writeCredentialProgmem(client, wifiFailureExplanation()) || !writeCredentialProgmem(client, PSTR("\n"))) return;
@@ -3860,7 +3866,8 @@ void configureProvisioningRoutes() {
     server.onNotFound([]() {
         WebResponseScope responseScope;
         if (!requireApWebPin()) return;
-        server.sendHeader("Location", PLATFORM_SETUP_BASE_URL "setup", true);
+        server.sendHeader("Location", String("http://") +
+            WiFi.softAPIP().toString() + "/setup", true);
         server.send(302, "text/plain", "");
     });
 }
