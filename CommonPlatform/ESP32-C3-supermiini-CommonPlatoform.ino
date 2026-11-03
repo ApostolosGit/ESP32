@@ -10,9 +10,9 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.05"
-#define VERSION "1.05"
-#define BUILD_DATE "28/10/2026"
+#define PLATFORM_VERSION "1.06"
+#define VERSION "1.06"
+#define BUILD_DATE "03/11/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
 #define DEVICE_LABEL "ESP32-C3"
@@ -89,7 +89,7 @@
 
 #define PLATFORM_STRINGIFY_INNER(value) #value
 #define PLATFORM_STRINGIFY(value) PLATFORM_STRINGIFY_INNER(value)
-#define PLATFORM_SETUP_IP_TEXT "192.168.1.79"
+#define PLATFORM_SETUP_IP_TEXT "192.168.2.XX"
 #define PLATFORM_SETUP_BASE_URL "http://" PLATFORM_SETUP_IP_TEXT "/"
 
 #include <Arduino.h>
@@ -936,13 +936,59 @@ bool credentialRestartPending = false;
 unsigned long credentialRestartRequestedMs = 0;
 unsigned long wifiOfflineSinceMs = 0;
 const unsigned long CREDENTIAL_RESTART_DELAY_MS = 1200UL;
-const unsigned long WIFI_RETRY_STEPS_MS[] = {1500UL};
+// Configured devices retry STA indefinitely. Router outages never auto-open setup AP.
+const unsigned long WIFI_RETRY_STEPS_MS[] = {1500UL, 3000UL, 5000UL, 10000UL, 30000UL};
 const unsigned long WIFI_ATTEMPT_TIMEOUT_MS = 15000UL;
 const uint8_t WIFI_MAX_FAILED_ATTEMPTS = 3;
 uint8_t wifiConsecutiveFailures = 0;
 uint32_t wifiFailedAttempts = 0;
 bool wifiAttemptActive = false;
 unsigned long wifiAttemptStartedMs = 0;
+
+// Common Platform 1.06 adaptive STA TX maximum, capped at 15 dBm.
+// ESP-IDF/Arduino's next level is 16.5 dBm, above the requested 16 dBm.
+const wifi_power_t WIFI_TX_LEVELS[] = {
+    WIFI_POWER_8_5dBm, WIFI_POWER_11dBm, WIFI_POWER_13dBm, WIFI_POWER_15dBm
+};
+const uint8_t WIFI_TX_LEVEL_TENTHS[] = {85, 110, 130, 150};
+const uint8_t WIFI_TX_LAST_LEVEL = 3;
+const unsigned long WIFI_TX_SCAN_TIMEOUT_MS = 7000UL;
+const unsigned long WIFI_TX_REEVALUATE_MS = 60000UL;
+uint8_t wifiTxCurrentLevel = 0;
+uint8_t wifiTxRetryFloor = 0;
+bool wifiTxApplied = false;
+bool wifiTxScanning = false;
+unsigned long wifiTxScanStartedMs = 0;
+unsigned long wifiTxLastAdjustedMs = 0;
+int wifiTxLastPreconnectRssi = -127;
+uint32_t wifiTxScanCount = 0;
+uint32_t wifiTxApplyFailures = 0;
+
+int wifiTxTenths() {
+    return wifiTxApplied ? (int)WIFI_TX_LEVEL_TENTHS[wifiTxCurrentLevel] : 0;
+}
+uint8_t wifiTxLevelForRssi(int rssi) {
+    if (rssi >= -66) return 0;  // 8.5 dBm
+    if (rssi >= -74) return 1;  // 11.0 dBm
+    if (rssi >= -81) return 2;  // 13.0 dBm
+    return 3;                   // 15.0 dBm
+}
+bool wifiTxApply(uint8_t level, const char* reason) {
+    if (level > WIFI_TX_LAST_LEVEL) level = WIFI_TX_LAST_LEVEL;
+    if (!WiFi.setTxPower(WIFI_TX_LEVELS[level])) {
+        ++wifiTxApplyFailures;
+        Serial.printf("[WiFi TX] setTxPower FAILED (%s)\n", reason);
+        return false;
+    }
+    wifiTxCurrentLevel = level;
+    wifiTxApplied = true;
+    wifiTxLastAdjustedMs = millis();
+    Serial.printf("[WiFi TX] requested max=%d.%d dBm (%s), not measured RF\n",
+        WIFI_TX_LEVEL_TENTHS[level] / 10,
+        WIFI_TX_LEVEL_TENTHS[level] % 10, reason);
+    return true;
+}
+
 bool wifiAttemptFailedEvent = false;
 uint16_t wifiAttemptEventReason = 0;
 bool wifiFallbackActive = false;
@@ -1330,7 +1376,8 @@ bool drawOledDiagnostic(unsigned long now) {
         platformDisplay.text(0, 40, credentialApName.c_str());
         snprintf(line, sizeof(line), "WiFi open PIN:%s", AP_WEB_PIN);
         platformDisplay.text(0, 50, line);
-        platformDisplay.text(0, 60, PLATFORM_SETUP_IP_TEXT "/setup");
+        snprintf(line, sizeof(line), "%s/setup", WiFi.softAPIP().toString().c_str());
+        platformDisplay.text(0, 60, line);
     } else {
         if (normalMeterInitialized && !recoveryMode) {
             applicationFormatSummary(line, sizeof(line));
@@ -1733,7 +1780,7 @@ const char* apFailureDescription(uint8_t code) {
 }
 
 const char* networkOperationDescription() {
-    if (credentialPortalOnly && wifiFallbackActive) return PSTR("Setup AP reopened after 3 failed router Wi-Fi attempts; edit Wi-Fi or IP settings");
+    if (wifiFallbackActive && credentialPortalActive) return PSTR("Router offline: AP+STA recovery; automatic router retries ongoing");
     if (credentialPortalOnly) return PSTR("AP-only setup: router Wi-Fi and MQTT are intentionally paused");
     if (recoveryMode) return PSTR("OTA-only recovery: MQTT measurements are paused");
     if (WiFi.status() != WL_CONNECTED) return PSTR("Waiting for the router Wi-Fi connection before MQTT can connect");
@@ -1935,13 +1982,16 @@ bool publishMeterHealth() {
         "\"oled\":\"%s\",\"profile\":\"%s\",\"ota_protocol\":%u,"
         "\"chip_id\":%lu,\"dual_zone\":%s,\"meter_ok\":%s,\"read_attempted\":%s,"
         "\"has_sample\":%s,\"last_sample_age_ms\":%s,\"read_failures\":%lu,"
-        "\"error\":\"%s\",\"rssi\":%d}"),
+        "\"error\":\"%s\",\"rssi\":%d,\"wifi_rssi_dbm\":%d,\"wifi_tx_max_dbm\":%.1f}"),
         DEVICE_KIND, mqttDeviceId, VERSION, APPLICATION_ID, PLATFORM_VERSION, DRIVER_ID,
         OLED_ID, OTA_PROFILE_ID, (unsigned)OTA_PROTOCOL_VERSION, (unsigned long)platformChipId(),
         applicationDualZoneEnabled() ? "true" : "false", lastMeterReadOk ? "true" : "false",
         meterReadAttempted ? "true" : "false", meterHasGoodSample ? "true" : "false", age,
         (unsigned long)meterReadFailures,
-        !meterReadAttempted ? "awaiting_first_read" : (lastMeterReadOk ? "" : PLATFORM_SENSOR_ERROR), (int)WiFi.RSSI());
+        !meterReadAttempted ? "awaiting_first_read" : (lastMeterReadOk ? "" : PLATFORM_SENSOR_ERROR),
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        (double)wifiTxTenths() / 10.0);
     if (n <= 0 || n >= (int)sizeof(payload)) return false;
     bool ok = mqttClient.publish(MQTT_HEALTH_TOPIC, payload, true);
     if (ok) {
@@ -2832,7 +2882,7 @@ bool writeWifiFallbackNotice(WiFiClient& client) {
     if (!wifiFallbackActive) return true;
     if (!writeCredentialProgmem(client, PSTR(
         "<div class='card' role='alert'><h2>Δεν μπορώ να συνδεθώ στο Wi-Fi</h2>"
-        "<p>Απέτυχαν 3 προσπάθειες σύνδεσης. Το Access Point παραμένει ανοικτό για διόρθωση των ρυθμίσεων.</p><p>Αιτία: <b>"))) return false;
+        "<p>Απέτυχαν 3 προσπάθειες σύνδεσης. Το AP λειτουργεί παράλληλα με τις επανασυνδέσεις και θα κλείσει αυτόματα όταν επιστρέψει ο router.</p><p>Αιτία: <b>"))) return false;
     if (!writeCredentialProgmem(client, wifiFailureExplanation())) return false;
     char detail[128];
     int n = snprintf(detail, sizeof(detail),
@@ -2882,6 +2932,12 @@ void handleCredentialSetupPage() {
         ".card{border:1px solid #dbe3e8;border-radius:12px;padding:14px;margin:12px 0}"
         "</style><style>body{font:22px/1.35 Arial,sans-serif;max-width:760px;margin:auto;padding:10px;color:#142431}h1,h2,small{font-size:inherit}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere}input,button{font:inherit}</style></head><body><h2>" DEVICE_LABEL " v" VERSION " setup</h2>"))) return;
     if (!writeWifiFallbackNotice(client)) return;
+    if (credentialPortalActive) {
+        const String apIpText = WiFi.softAPIP().toString();
+        if (!writeCredentialProgmem(client, PSTR("<p>Setup AP IP: <b>")) ||
+            !writeCredentialHtmlEscaped(client, apIpText.c_str()) ||
+            !writeCredentialProgmem(client, PSTR("</b></p>"))) return;
+    }
 #if PLATFORM_REQUIRE_ROUTER_BEFORE_APPLICATION
     if (!writeCredentialProgmem(client, PSTR(
         "<p>Πρώτα ρυθμίστε και συνδέστε το Wi-Fi του router. Η οθόνη και οι αισθητήρες ξεκινούν μόνο μετά τη σύνδεση. Δεν απαιτείται σύνδεση MQTT.</p>"))) return;
@@ -2909,7 +2965,7 @@ void handleCredentialSetupPage() {
     if (!writeCredentialHtmlEscaped(client, octetText)) return;
     if (!writeCredentialProgmem(client, PSTR(
         "'><small>Προεπιλογή εφαρμογής: 192.168.1." PLATFORM_STRINGIFY(SITE_IP_D)
-        ". Το AP ανοίγει πάντα στο " PLATFORM_SETUP_IP_TEXT ".</small>"
+        ". Το AP ανοίγει στο 192.168.2.XX (XX = LAN IP).</small>"
         "<label>MQTT username</label><input name='mqtt_user' maxlength='64' value='"))) return;
     if (haveStored && !writeCredentialHtmlEscaped(client, stored.mqttUser)) return;
 
@@ -2993,9 +3049,9 @@ void handleCredentialSave() {
         "<!doctype html><html><body><h2>Saved</h2>"
         "<p>Saved and read-back verified. Restarting with the stored Wi-Fi settings.</p>"
         "<p>After connecting to the router, open <a href='http://192.168.1.%u/'>http://192.168.1.%u/</a>.</p>"
-        "<p>After 3 failed Wi-Fi attempts, reconnect to the setup AP at " PLATFORM_SETUP_BASE_URL ".</p>"
+        "<p>After 3 failed Wi-Fi attempts, the temporary AP opens at http://192.168.2.%u/ with ongoing Wi-Fi retries.</p>"
         "<p>MQTT rejection will not erase settings or disable router Wi-Fi.</p></body></html>",
-        (unsigned)selectedOctet, (unsigned)selectedOctet);
+        (unsigned)selectedOctet, (unsigned)selectedOctet, (unsigned)selectedOctet);
     server.send(200, "text/html; charset=utf-8", reply);
     credentialRestartPending = true;
     credentialRestartRequestedMs = millis();
@@ -3310,7 +3366,7 @@ void handleNetworkDebugPage() {
         PLATFORM_REQUIRE_ROUTER_BEFORE_APPLICATION ? "ROUTER FIRST" : "LOCAL FIRST",
         normalMeterInitialized ? "YES" : "NO", bootOledReady ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
-    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nFallback AP: %s\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
+    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nSetup AP active: %s (automatic after 3 failures or manual)\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
     if (wifiFallbackActive) {
         if (!writeCredentialProgmem(client, wifiFailureExplanation()) || !writeCredentialProgmem(client, PSTR("\n"))) return;
@@ -3333,6 +3389,21 @@ void handleNetworkDebugPage() {
         WiFi.status() == WL_CONNECTED ? (int)WiFi.channel() : 0, USE_STATIC_IP ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line)) return;
     if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
+
+    const int txTenths = wifiTxTenths();
+    char txLine[384];
+    n = snprintf_P(txLine, sizeof(txLine),
+        PSTR("Wi-Fi RX RSSI: %d dBm (connected only)\n"
+             "Wi-Fi TX requested max: %d.%d dBm (not measured)\n"
+             "Adaptive TX hard cap: 15.0 dBm\n"
+             "Preconnect scan RSSI: %d dBm (-127 = unknown)\n"
+             "TX scans: %lu; set-power failures: %lu\n"
+             "Router outage policy: STA retries, no automatic AP\n"),
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        txTenths / 10, txTenths % 10, wifiTxLastPreconnectRssi,
+        (unsigned long)wifiTxScanCount, (unsigned long)wifiTxApplyFailures);
+    if (n <= 0 || n >= (int)sizeof(txLine)) return;
+    if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(txLine),(size_t)n)) return;
 
     if (WiFi.status() == WL_CONNECTED) {
         IPAddress lip = WiFi.localIP();
@@ -3505,12 +3576,17 @@ void configureCredentialRoutes() {
     credentialRoutesConfigured = true;
 }
 
+IPAddress platformSetupApAddress() {
+    // E.g. STA 192.168.1.82 -> fallback/manual AP 192.168.2.82.
+    return IPAddress(192, 168, 2, configuredStaOctet);
+}
 bool configureSetupApAddress() {
-    const IPAddress setupIp(192, 168, 1, 79);
+    const IPAddress setupIp = platformSetupApAddress();
     const IPAddress setupMask(255, 255, 255, 0);
-    const IPAddress leaseStart(192, 168, 1, 80);
-    // Core 3.3.12 supports an explicit DHCP lease start and validates that the
-    // AP/gateway are outside the pool (.2-.12), using native esp_netif APIs.
+    // Keep DHCP leases away from the gateway even for arbitrary XX.
+    const uint8_t leaseOctet = (configuredStaOctet >= 100 && configuredStaOctet < 200)
+                                ? 220 : 100;
+    const IPAddress leaseStart(192, 168, 2, leaseOctet);
     return WiFi.softAPConfig(setupIp, setupIp, setupMask, leaseStart, setupIp) &&
            WiFi.softAPIP() == setupIp;
 }
@@ -3554,7 +3630,7 @@ bool platformReadSetupApState() {
     if (credentialApLastNativeError != ESP_OK) return false;
     credentialApBandwidth = (uint8_t)bandwidth;
     credentialApLastCheckStage = 18;
-    if (WiFi.softAPIP() != IPAddress(192, 168, 1, 79)) {
+    if (WiFi.softAPIP() != platformSetupApAddress()) {
         credentialApLastNativeError = ESP_ERR_INVALID_STATE;
         return false;
     }
@@ -3588,6 +3664,13 @@ int platformSetupApLiveState() {
 }
 
 bool platformStartSetupApRadio() {
+    // A manual AP transition may interrupt an in-flight STA RSSI scan.
+    if (wifiTxScanning) {
+        (void)esp_wifi_scan_stop();
+        WiFi.scanDelete();
+        wifiTxScanning = false;
+        wifiAttemptActive = false;
+    }
     credentialApStateVerified = false;
     credentialApLastNativeError = ESP_OK;
     credentialApLastFailure = 1;
@@ -3595,8 +3678,10 @@ bool platformStartSetupApRadio() {
     // In particular, softAPdisconnect() on an OFF C3 would first start an AP.
     WiFi.persistent(false);
     credentialApLastCheckStage = 2;
-    if (WiFi.getMode() != WIFI_AP) {
-        if (!WiFi.mode(WIFI_AP)) {
+    const wifi_mode_t requestedMode =
+        wifiFallbackActive && !credentialPortalOnly ? WIFI_AP_STA : WIFI_AP;
+    if (WiFi.getMode() != requestedMode) {
+        if (!WiFi.mode(requestedMode)) {
             credentialApLastNativeError = ESP_FAIL;
             return false;
         }
@@ -3612,6 +3697,11 @@ bool platformStartSetupApRadio() {
     }
     credentialApLastFailure = 3;
     credentialApLastCheckStage = 5;
+    // Safe TX limit on setup AP too, before the SSID is advertised.
+    if (!wifiTxApply(0, "setup AP")) {
+        credentialApLastNativeError = ESP_FAIL;
+        return false;
+    }
     // Keep the SDK's normal PHY defaults, as in the legacy working Boiler.
     // Channel1, visible SSID, open Wi-Fi; the page still requires its PIN.
     if (!WiFi.softAP(credentialApName.c_str(), nullptr, CREDENTIAL_AP_CHANNEL,
@@ -3640,8 +3730,7 @@ void startCredentialAccessPoint(bool portalOnly) {
     markCrashStage(CRASH_STAGE_BOOT_AP_START, ESP.getFreeHeap());
     bootCheckpoint(CRASH_STAGE_BOOT_AP_START);
 
-    (void)portalOnly;
-    credentialPortalOnly = true;
+    credentialPortalOnly = portalOnly;
     credentialDns.stop();
     credentialApName = String(DEVICE_LABEL "-") + DEVICE_ID + "-" +
                        String(platformChipId() & 0xFFFFFFUL, HEX);
@@ -3671,13 +3760,14 @@ void startCredentialAccessPoint(bool portalOnly) {
     credentialApLastAction = "setup_running";
     credentialDns.start(53, "*", WiFi.softAPIP());
     configureCredentialRoutes();
-    server.begin();
+    // The server may already be listening on STA during a router outage.
+    if (!networkServicesStarted) server.begin();
     if (drawOledDiagnostic(millis())) return;
     cs();
     doublePrintf(420, 1, 1, "SETUP AP / v%s", VERSION);
     doublePrintf(420, 2, 1, "%s", credentialApName.c_str());
     doublePrintf(420, 3, 1, "WiFi open PIN:%s", AP_WEB_PIN);
-    doublePrintf(420, 4, 1, "Open: " PLATFORM_SETUP_IP_TEXT);
+    doublePrintf(420, 4, 1, "Open: %s", WiFi.softAPIP().toString().c_str());
 }
 
 void serviceCredentialApHealth(unsigned long now) {
@@ -3719,14 +3809,15 @@ void serviceCredentialApHealth(unsigned long now) {
 
 void stopCredentialAccessPoint() {
     if (!credentialPortalActive || credentialPortalOnly) return;
+    // Remove only AP: do not power off the shared AP+STA radio.
+    if (!WiFi.mode(WIFI_STA)) return;
     credentialDns.stop();
-    WiFi.softAPdisconnect(true);
     credentialPortalActive = false;
     credentialApStateVerified = false;
     resetApWebSession();
     credentialApName = "";
     credentialApPassword = "";
-    if (WiFi.status() == WL_CONNECTED) WiFi.mode(WIFI_STA);
+    wifiFallbackActive = false;
 }
 
 // Save/clear can be requested over LAN, AP or Recovery, including failed AP starts.
@@ -3746,8 +3837,9 @@ void serviceCredentialPortal(unsigned long now) {
     serviceCredentialApHealth(now);
     if (!credentialPortalActive) {
         // A failed AP start is not a permanent dead end in provisioning/Recovery.
-        if (credentialPortalOnly && (uint32_t)(now - credentialPortalLastAttemptMs) >= CREDENTIAL_AP_RETRY_MS) {
-            startCredentialAccessPoint(true);
+        if ((credentialPortalOnly || wifiFallbackActive) &&
+            (uint32_t)(now - credentialPortalLastAttemptMs) >= CREDENTIAL_AP_RETRY_MS) {
+            startCredentialAccessPoint(credentialPortalOnly);
         }
         return;
     }
@@ -3762,7 +3854,8 @@ void configureProvisioningRoutes() {
     server.onNotFound([]() {
         WebResponseScope responseScope;
         if (!requireApWebPin()) return;
-        server.sendHeader("Location", PLATFORM_SETUP_BASE_URL "setup", true);
+        server.sendHeader("Location", String("http://") +
+            WiFi.softAPIP().toString() + "/setup", true);
         server.send(302, "text/plain", "");
     });
 }
@@ -3819,7 +3912,8 @@ void configureWebRoutes() {
     configureCredentialRoutes();
     server.on("/live", HTTP_GET, handleRoot);
     server.on("/", HTTP_GET, []() {
-        if (credentialPortalOnly) handleCredentialSetupPage();
+        if (credentialPortalOnly || (wifiFallbackActive && credentialPortalActive))
+            handleCredentialSetupPage();
         else handleRoot();
     });
     server.on("/force-ota-recovery-confirm", HTTP_GET, handleForceOtaRecoveryConfirm);
@@ -3829,8 +3923,9 @@ void configureWebRoutes() {
     server.onNotFound([]() {
         WebResponseScope responseScope;
         if (!requireApWebPin()) return;
-        if (credentialPortalOnly) {
-            server.sendHeader("Location", PLATFORM_SETUP_BASE_URL "setup", true);
+        if (credentialPortalOnly || (wifiFallbackActive && credentialPortalActive)) {
+            server.sendHeader("Location", String("http://") +
+                WiFi.softAPIP().toString() + "/setup", true);
             server.send(302, "text/plain", "");
             return;
         }
@@ -3925,7 +4020,8 @@ void servicePendingWiFiDisconnect() {
     const uint16_t reason = pendingWiFiDisconnectReason;
     wifiDisconnectPending = false;
     portEXIT_CRITICAL(&wifiEventMux);
-    if (!pending || credentialPortalOnly || WiFi.getMode() != WIFI_STA ||
+    if (!pending || credentialPortalOnly ||
+        (WiFi.getMode() != WIFI_STA && WiFi.getMode() != WIFI_AP_STA) ||
         reason == WIFI_REASON_AUTH_LEAVE || reason == WIFI_REASON_ASSOC_LEAVE) return;
     wifiLastDisconnectReason = reason;
     if (wifiAttemptActive && !wifiAttemptFailedEvent) {
@@ -3934,18 +4030,8 @@ void servicePendingWiFiDisconnect() {
     }
 }
 
-void enterWiFiFallback() {
-    wifiAttemptActive = false;
-    wifiFallbackActive = true;
-    wifiWasConnected = false;
-    mqttNet.stop();
-    server.stop();
-    networkServicesStarted = false;
-    if (recoveryMode) configureRecoveryRoutes();
-    else configureWebRoutes();
-    startCredentialAccessPoint(true);
-}
-
+// After three router failures, open temporary AP+STA for local access.
+// Continue STA retries; automatic AP closes when STA reconnects. FLASH keeps manual AP.
 void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     if (!wifiAttemptActive) return; // Only one terminal result per explicit attempt.
     wifiAttemptActive = false;
@@ -3955,8 +4041,17 @@ void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     wifiFallbackFailureKind = kind;
     wifiFallbackReason = reason;
     wifiFallbackStatus = status;
+    // Permit retry power escalation only within 15 dBm.
+    if (wifiTxCurrentLevel < WIFI_TX_LAST_LEVEL)
+        wifiTxRetryFloor = wifiTxCurrentLevel == 0 ? 2 : WIFI_TX_LAST_LEVEL;
+    if (wifiRetryStep + 1 < WIFI_RETRY_STEP_COUNT) ++wifiRetryStep;
     lastWifiRetry = millis();
-    if (wifiConsecutiveFailures >= WIFI_MAX_FAILED_ATTEMPTS) enterWiFiFallback();
+    // Three failed connections open an AP+STA (not AP-only) for local recovery.
+    if (wifiConsecutiveFailures >= WIFI_MAX_FAILED_ATTEMPTS &&
+        !wifiFallbackActive && !credentialPortalOnly && ssid[0]) {
+        wifiFallbackActive = true;
+        startCredentialAccessPoint(false);
+    }
 }
 
 void startTrackedWiFiAttempt() {
@@ -3973,17 +4068,70 @@ void startTrackedWiFiAttempt() {
     wifiAttemptStartedMs = millis();
     lastWifiRetry = wifiAttemptStartedMs;
     ++wifiConnectAttempts;
-    if (WiFi.getMode() != WIFI_STA && !WiFi.mode(WIFI_STA)) {
+    const wifi_mode_t targetMode =
+        wifiFallbackActive && credentialPortalActive ? WIFI_AP_STA : WIFI_STA;
+    if (WiFi.getMode() != targetMode && !WiFi.mode(targetMode)) {
         finishWiFiAttemptFailure(3, 0, (int)WiFi.status());
         return;
     }
     WiFi.setAutoReconnect(false);
+    // Fail closed when requested TX ceiling cannot be installed.
+    if (!wifiTxApply(0, "preconnect safe limit")) {
+        finishWiFiAttemptFailure(6, 0, (int)WiFi.status());
+        return;
+    }
     const IPAddress localIp(192, 168, 1, configuredStaOctet);
     const IPAddress gateway(192, 168, 1, 1), subnet(255, 255, 255, 0);
     if (!WiFi.config(localIp, gateway, subnet, gateway)) {
         finishWiFiAttemptFailure(4, 0, (int)WiFi.status());
         return;
     }
+    // In AP+STA recovery, avoid explicit all-channel scans on every retry:
+    // they interrupt AP service. Use bounded 15 dBm and normal STA join.
+    if (wifiFallbackActive && credentialPortalActive) {
+        if (!wifiTxApply(WIFI_TX_LAST_LEVEL, "AP+STA recovery")) {
+            finishWiFiAttemptFailure(6, 0, (int)WiFi.status());
+            return;
+        }
+        const int result = (int)WiFi.begin(ssid, password);
+        if (result == 4 || result == 255)
+            finishWiFiAttemptFailure(5, 0, result);
+        return;
+    }
+    // The initial/pre-AP scan is asynchronous.
+    wifiTxScanning = true;
+    wifiTxScanStartedMs = millis();
+    ++wifiTxScanCount;
+    const int scanStart = WiFi.scanNetworks(true, true, false, 120);
+    if (scanStart != WIFI_SCAN_RUNNING)
+        wifiTxScanStartedMs = millis() - WIFI_TX_SCAN_TIMEOUT_MS;
+}
+
+void serviceWifiTxPrescan(unsigned long now) {
+    if (!wifiTxScanning) return;
+    int count = WiFi.scanComplete();
+    if (count == WIFI_SCAN_RUNNING &&
+        (uint32_t)(now - wifiTxScanStartedMs) < WIFI_TX_SCAN_TIMEOUT_MS) return;
+    if (count == WIFI_SCAN_RUNNING) {
+        (void)esp_wifi_scan_stop();
+        count = WiFi.scanComplete();
+    }
+    wifiTxLastPreconnectRssi = -127;
+    for (int i = 0; i < count; ++i) {
+        if (WiFi.SSID(i) == ssid && (int)WiFi.RSSI(i) > wifiTxLastPreconnectRssi)
+            wifiTxLastPreconnectRssi = (int)WiFi.RSSI(i);
+    }
+    WiFi.scanDelete();
+    wifiTxScanning = false;
+
+    uint8_t chosen = wifiTxLastPreconnectRssi == -127
+        ? 0 : wifiTxLevelForRssi(wifiTxLastPreconnectRssi);
+    if (chosen < wifiTxRetryFloor) chosen = wifiTxRetryFloor;
+    if (!wifiTxApply(chosen, "preconnect RSSI / bounded retry")) {
+        finishWiFiAttemptFailure(6, 0, (int)WiFi.status());
+        return;
+    }
+    wifiAttemptStartedMs = millis(); // association timeout, excluding scan
     const int result = (int)WiFi.begin(ssid, password);
     if (result == 4 || result == 255) finishWiFiAttemptFailure(5, 0, result);
 }
@@ -4036,7 +4184,17 @@ bool serviceNetworkStackRecovery(unsigned long now) {
 void serviceWiFiReconnect(unsigned long now) {
     servicePendingWiFiDisconnect();
     if (credentialPortalOnly || !ssid[0]) return;
+    if (wifiTxScanning) {
+        serviceWifiTxPrescan(now);
+        return;
+    }
     if (WiFi.status() == WL_CONNECTED) {
+        // Also close automatic AP in OTA-only Recovery, where the ordinary
+        // NetworkPriority loop is not entered. FLASH-owned AP is protected.
+        if (credentialPortalActive && !credentialPortalOnly) {
+            stopCredentialAccessPoint();
+            if (credentialPortalActive) return; // retry AP close next loop
+        }
         if (!wifiWasConnected) {
             lastMqttReconnectMs = 0;
             mqttRetryStep = 0;
@@ -4052,6 +4210,14 @@ void serviceWiFiReconnect(unsigned long now) {
         wifiRetryStep = 0;
         wifiOfflineSinceMs = 0;
         wifiLastDisconnectReason = 0;
+        wifiTxRetryFloor = 0;
+        if ((uint32_t)(now - wifiTxLastAdjustedMs) >= WIFI_TX_REEVALUATE_MS) {
+            const uint8_t desired = wifiTxLevelForRssi((int)WiFi.RSSI());
+            if (desired != wifiTxCurrentLevel)
+                (void)wifiTxApply(desired, "associated RSSI");
+            else
+                wifiTxLastAdjustedMs = now;
+        }
         return;
     }
     if (wifiWasConnected) {
@@ -4071,7 +4237,7 @@ void serviceWiFiReconnect(unsigned long now) {
         }
         return;
     }
-    if ((uint32_t)(now - lastWifiRetry) >= WIFI_RETRY_STEPS_MS[0]) startTrackedWiFiAttempt();
+    if ((uint32_t)(now - lastWifiRetry) >= WIFI_RETRY_STEPS_MS[wifiRetryStep]) startTrackedWiFiAttempt();
 }
 
 // Both millis() and digitalRead() are IRAM-safe in the pinned ESP32-C3 core.
@@ -4152,12 +4318,25 @@ void serviceFlashSetupButton(unsigned long now) {
     }
     if (credentialPortalOnly) {
         exitManualSetupAccessPoint();
+    } else if (wifiFallbackActive && credentialPortalActive) {
+        // FLASH takes ownership: do not automatically close this manual AP.
+        wifiFallbackActive = false;
+        credentialPortalOnly = true;
+        wifiAttemptActive = false;
+        if (wifiTxScanning) {
+            (void)esp_wifi_scan_stop();
+            WiFi.scanDelete();
+            wifiTxScanning = false;
+        }
+        WiFi.mode(WIFI_AP);
+        credentialApLastAction = "manual_takeover";
     } else {
-        // Setup deliberately pauses STA/MQTT; its AP remains 192.168.1.79.
+        // Manual setup pauses STA/MQTT and stays open until FLASH / restart.
         // Local reads/accounting remain enabled; saved credentials are untouched.
         mqttNet.stop();
         wifiWasConnected = false;
         networkServicesStarted = false;
+        wifiFallbackActive = false;
         startCredentialAccessPoint(true);
         credentialApLastAction = "boot_open_setup";
         wifiHintVisible = true;
@@ -4195,9 +4374,8 @@ void drawWiFiStatusHint(unsigned long now) {
             snprintf(line, sizeof(line), "WiFi open PIN:%s", AP_WEB_PIN);
             platformDisplay.text(0, 44, line);
             platformDisplay.font(DisplayFont::Tiny4x6);
-            platformDisplay.text(0, 60, ssid[0] && password[0]
-                ? PLATFORM_SETUP_IP_TEXT "/setup BOOT:exit"
-                : PLATFORM_SETUP_IP_TEXT "/setup SAVE WiFi");
+            snprintf(line, sizeof(line), "AP: %s", WiFi.softAPIP().toString().c_str());
+            platformDisplay.text(0, 60, line);
         } else {
             platformDisplay.font(DisplayFont::Small5x7);
             snprintf(line, sizeof(line), "Stage:%u err:%ld", (unsigned)credentialApLastCheckStage, (long)credentialApLastNativeError);
@@ -4207,7 +4385,7 @@ void drawWiFiStatusHint(unsigned long now) {
         }
     } else {
         platformDisplay.font(DisplayFont::Small5x7);
-        platformDisplay.text(0, 12, wifiFailureLabel());
+        platformDisplay.text(0, 12, wifiFallbackActive ? "AP+STA router retry" : wifiFailureLabel());
         const bool checkPassword =
             wifiLastDisconnectReason == WIFI_REASON_AUTH_FAIL ||
             wifiLastDisconnectReason == WIFI_REASON_802_1X_AUTH_FAILED ||
@@ -4219,7 +4397,12 @@ void drawWiFiStatusHint(unsigned long now) {
         const unsigned long remaining = age >= gap ? 0 : gap - age;
         snprintf(line, sizeof(line), "Retry in %lus", (remaining + 999UL) / 1000UL);
         platformDisplay.text(0, 44, line);
-        platformDisplay.text(0, 60, "FLASH: AP setup");
+        if (wifiFallbackActive && credentialPortalActive) {
+            snprintf(line, sizeof(line), "AP: %s", WiFi.softAPIP().toString().c_str());
+            platformDisplay.text(0, 60, line);
+        } else {
+            platformDisplay.text(0, 60, "FLASH: AP setup");
+        }
     }
     platformDisplay.present();
 }
@@ -4315,12 +4498,13 @@ bool platformWebWriteStatus(WiFiClient& client) {
         "<section class='platform-status'><p><a href='/network-debug'>Network Debug</a>"
         "<a href='/setup'>Network Setup</a></p>");
     if (!writeRootProgmemViaRam(client, links, strlen_P(links))) return false;
-    char line[192];
+    char line[256];
     const int n = snprintf_P(line, sizeof(line),
-        PSTR("<pre>Wi-Fi: %s\nMQTT: %s\nRSSI: %d dBm\nFree heap: %lu bytes</pre></section>"),
+        PSTR("<pre>Wi-Fi: %s\nMQTT: %s\nRX RSSI: %d dBm\nTX max: %.1f dBm (configured, not measured)\nAdaptive TX cap: 15.0 dBm\nFree heap: %lu bytes</pre></section>"),
         WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE",
         mqttClient.connected() ? "CONNECTED" : "DISCONNECTED",
-        (int)WiFi.RSSI(), (unsigned long)ESP.getFreeHeap());
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        (double)wifiTxTenths() / 10.0, (unsigned long)ESP.getFreeHeap());
     return n > 0 && n < (int)sizeof(line) &&
         writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n);
 }
@@ -4726,7 +4910,7 @@ void loop() {
 
     if (recoveryMode) {
         serviceFlashSetupButton(now);
-        if (credentialPortalActive || credentialPortalOnly) serviceCredentialPortal(now);
+        if (credentialPortalActive || credentialPortalOnly || wifiFallbackActive) serviceCredentialPortal(now);
         serviceRecoveryOnly(now);
         serviceOledDiagnostic(millis());
         return;
@@ -4736,7 +4920,7 @@ void loop() {
     // Setup/reconnection is a platform-only loop. No OLED/sensor/history work
     // runs until the router has supplied a usable station connection.
     serviceFlashSetupButton(now);
-    if (credentialPortalActive || credentialPortalOnly) serviceCredentialPortal(now);
+    if (credentialPortalActive || credentialPortalOnly || wifiFallbackActive) serviceCredentialPortal(now);
     serviceWiFiReconnect(millis());
     if (!serviceRouterFirstApplication(millis())) {
         serviceOledDiagnostic(millis());
@@ -4769,7 +4953,7 @@ void loop() {
         meterDisplayUpdated = true;
     }
     serviceFlashSetupButton(millis());
-    if (credentialPortalActive || credentialPortalOnly) serviceCredentialPortal(millis());
+    if (credentialPortalActive || credentialPortalOnly || wifiFallbackActive) serviceCredentialPortal(millis());
     if (serviceNetworkStackRecovery(millis())) {
         serviceOledDiagnostic(millis());
         yield();
