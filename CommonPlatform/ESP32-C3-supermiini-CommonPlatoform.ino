@@ -4189,6 +4189,12 @@ void serviceWiFiReconnect(unsigned long now) {
         return;
     }
     if (WiFi.status() == WL_CONNECTED) {
+        // Also close automatic AP in OTA-only Recovery, where the ordinary
+        // NetworkPriority loop is not entered. FLASH-owned AP is protected.
+        if (credentialPortalActive && !credentialPortalOnly) {
+            stopCredentialAccessPoint();
+            if (credentialPortalActive) return; // retry AP close next loop
+        }
         if (!wifiWasConnected) {
             lastMqttReconnectMs = 0;
             mqttRetryStep = 0;
