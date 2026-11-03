@@ -3651,6 +3651,13 @@ int platformSetupApLiveState() {
 }
 
 bool platformStartSetupApRadio() {
+    // A manual AP transition may interrupt an in-flight STA RSSI scan.
+    if (wifiTxScanning) {
+        (void)esp_wifi_scan_stop();
+        WiFi.scanDelete();
+        wifiTxScanning = false;
+        wifiAttemptActive = false;
+    }
     credentialApStateVerified = false;
     credentialApLastNativeError = ESP_OK;
     credentialApLastFailure = 1;
@@ -4184,7 +4191,7 @@ void serviceWiFiReconnect(unsigned long now) {
         }
         return;
     }
-    if ((uint32_t)(now - lastWifiRetry) >= WIFI_RETRY_STEPS_MS[0]) startTrackedWiFiAttempt();
+    if ((uint32_t)(now - lastWifiRetry) >= WIFI_RETRY_STEPS_MS[wifiRetryStep]) startTrackedWiFiAttempt();
 }
 
 // Both millis() and digitalRead() are IRAM-safe in the pinned ESP32-C3 core.
