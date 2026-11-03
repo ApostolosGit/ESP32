@@ -10,9 +10,9 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.05"
-#define VERSION "1.05"
-#define BUILD_DATE "28/10/2026"
+#define PLATFORM_VERSION "1.06"
+#define VERSION "1.06"
+#define BUILD_DATE "03/11/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
 #define DEVICE_LABEL "ESP32-C3"
@@ -936,13 +936,59 @@ bool credentialRestartPending = false;
 unsigned long credentialRestartRequestedMs = 0;
 unsigned long wifiOfflineSinceMs = 0;
 const unsigned long CREDENTIAL_RESTART_DELAY_MS = 1200UL;
-const unsigned long WIFI_RETRY_STEPS_MS[] = {1500UL};
+// Configured devices retry STA indefinitely. Router outages never auto-open setup AP.
+const unsigned long WIFI_RETRY_STEPS_MS[] = {1500UL, 3000UL, 5000UL, 10000UL, 30000UL};
 const unsigned long WIFI_ATTEMPT_TIMEOUT_MS = 15000UL;
 const uint8_t WIFI_MAX_FAILED_ATTEMPTS = 3;
 uint8_t wifiConsecutiveFailures = 0;
 uint32_t wifiFailedAttempts = 0;
 bool wifiAttemptActive = false;
 unsigned long wifiAttemptStartedMs = 0;
+
+// Common Platform 1.06 adaptive STA TX maximum, capped at 15 dBm.
+// ESP-IDF/Arduino's next level is 16.5 dBm, above the requested 16 dBm.
+const wifi_power_t WIFI_TX_LEVELS[] = {
+    WIFI_POWER_8_5dBm, WIFI_POWER_11dBm, WIFI_POWER_13dBm, WIFI_POWER_15dBm
+};
+const uint8_t WIFI_TX_LEVEL_TENTHS[] = {85, 110, 130, 150};
+const uint8_t WIFI_TX_LAST_LEVEL = 3;
+const unsigned long WIFI_TX_SCAN_TIMEOUT_MS = 7000UL;
+const unsigned long WIFI_TX_REEVALUATE_MS = 60000UL;
+uint8_t wifiTxCurrentLevel = 0;
+uint8_t wifiTxRetryFloor = 0;
+bool wifiTxApplied = false;
+bool wifiTxScanning = false;
+unsigned long wifiTxScanStartedMs = 0;
+unsigned long wifiTxLastAdjustedMs = 0;
+int wifiTxLastPreconnectRssi = -127;
+uint32_t wifiTxScanCount = 0;
+uint32_t wifiTxApplyFailures = 0;
+
+int wifiTxTenths() {
+    return wifiTxApplied ? (int)WIFI_TX_LEVEL_TENTHS[wifiTxCurrentLevel] : 0;
+}
+uint8_t wifiTxLevelForRssi(int rssi) {
+    if (rssi >= -66) return 0;  // 8.5 dBm
+    if (rssi >= -74) return 1;  // 11.0 dBm
+    if (rssi >= -81) return 2;  // 13.0 dBm
+    return 3;                   // 15.0 dBm
+}
+bool wifiTxApply(uint8_t level, const char* reason) {
+    if (level > WIFI_TX_LAST_LEVEL) level = WIFI_TX_LAST_LEVEL;
+    if (!WiFi.setTxPower(WIFI_TX_LEVELS[level])) {
+        ++wifiTxApplyFailures;
+        Serial.printf("[WiFi TX] setTxPower FAILED (%s)\n", reason);
+        return false;
+    }
+    wifiTxCurrentLevel = level;
+    wifiTxApplied = true;
+    wifiTxLastAdjustedMs = millis();
+    Serial.printf("[WiFi TX] requested max=%d.%d dBm (%s), not measured RF\n",
+        WIFI_TX_LEVEL_TENTHS[level] / 10,
+        WIFI_TX_LEVEL_TENTHS[level] % 10, reason);
+    return true;
+}
+
 bool wifiAttemptFailedEvent = false;
 uint16_t wifiAttemptEventReason = 0;
 bool wifiFallbackActive = false;
@@ -1935,13 +1981,16 @@ bool publishMeterHealth() {
         "\"oled\":\"%s\",\"profile\":\"%s\",\"ota_protocol\":%u,"
         "\"chip_id\":%lu,\"dual_zone\":%s,\"meter_ok\":%s,\"read_attempted\":%s,"
         "\"has_sample\":%s,\"last_sample_age_ms\":%s,\"read_failures\":%lu,"
-        "\"error\":\"%s\",\"rssi\":%d}"),
+        "\"error\":\"%s\",\"rssi\":%d,\"wifi_rssi_dbm\":%d,\"wifi_tx_max_dbm\":%.1f}"),
         DEVICE_KIND, mqttDeviceId, VERSION, APPLICATION_ID, PLATFORM_VERSION, DRIVER_ID,
         OLED_ID, OTA_PROFILE_ID, (unsigned)OTA_PROTOCOL_VERSION, (unsigned long)platformChipId(),
         applicationDualZoneEnabled() ? "true" : "false", lastMeterReadOk ? "true" : "false",
         meterReadAttempted ? "true" : "false", meterHasGoodSample ? "true" : "false", age,
         (unsigned long)meterReadFailures,
-        !meterReadAttempted ? "awaiting_first_read" : (lastMeterReadOk ? "" : PLATFORM_SENSOR_ERROR), (int)WiFi.RSSI());
+        !meterReadAttempted ? "awaiting_first_read" : (lastMeterReadOk ? "" : PLATFORM_SENSOR_ERROR),
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        (double)wifiTxTenths() / 10.0);
     if (n <= 0 || n >= (int)sizeof(payload)) return false;
     bool ok = mqttClient.publish(MQTT_HEALTH_TOPIC, payload, true);
     if (ok) {
@@ -3310,7 +3359,7 @@ void handleNetworkDebugPage() {
         PLATFORM_REQUIRE_ROUTER_BEFORE_APPLICATION ? "ROUTER FIRST" : "LOCAL FIRST",
         normalMeterInitialized ? "YES" : "NO", bootOledReady ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
-    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nFallback AP: %s\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
+    n = snprintf(line, sizeof(line), "Configured LAN IP: 192.168.1.%u\nWi-Fi failed attempts: %lu; consecutive: %u/3\nSetup AP active: %s (manual/unprovisioned only)\n", (unsigned)configuredStaOctet, (unsigned long)wifiFailedAttempts, (unsigned)wifiConsecutiveFailures, wifiFallbackActive ? "YES" : "NO");
     if (n <= 0 || n >= (int)sizeof(line) || !writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n)) return;
     if (wifiFallbackActive) {
         if (!writeCredentialProgmem(client, wifiFailureExplanation()) || !writeCredentialProgmem(client, PSTR("\n"))) return;
@@ -3331,6 +3380,20 @@ void handleNetworkDebugPage() {
     n = snprintf_P(line, sizeof(line), PSTR(")\nRSSI dBm: %d\nChannel: %d\nStatic IP profile: %s\n"),
         WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
         WiFi.status() == WL_CONNECTED ? (int)WiFi.channel() : 0, USE_STATIC_IP ? "YES" : "NO");
+    if (n <= 0 || n >= (int)sizeof(line)) return;
+    if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
+
+    const int txTenths = wifiTxTenths();
+    n = snprintf_P(line, sizeof(line),
+        PSTR("Wi-Fi RX RSSI: %d dBm (connected only)\n"
+             "Wi-Fi TX requested max: %d.%d dBm (not measured)\n"
+             "Adaptive TX hard cap: 15.0 dBm\n"
+             "Preconnect scan RSSI: %d dBm (-127 = unknown)\n"
+             "TX scans: %lu; set-power failures: %lu\n"
+             "Router outage policy: STA retries, no automatic AP\n"),
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        txTenths / 10, txTenths % 10, wifiTxLastPreconnectRssi,
+        (unsigned long)wifiTxScanCount, (unsigned long)wifiTxApplyFailures);
     if (n <= 0 || n >= (int)sizeof(line)) return;
     if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
 
@@ -3612,6 +3675,11 @@ bool platformStartSetupApRadio() {
     }
     credentialApLastFailure = 3;
     credentialApLastCheckStage = 5;
+    // Safe TX limit on setup AP too, before the SSID is advertised.
+    if (!wifiTxApply(0, "setup AP")) {
+        credentialApLastNativeError = ESP_FAIL;
+        return false;
+    }
     // Keep the SDK's normal PHY defaults, as in the legacy working Boiler.
     // Channel1, visible SSID, open Wi-Fi; the page still requires its PIN.
     if (!WiFi.softAP(credentialApName.c_str(), nullptr, CREDENTIAL_AP_CHANNEL,
@@ -3934,18 +4002,8 @@ void servicePendingWiFiDisconnect() {
     }
 }
 
-void enterWiFiFallback() {
-    wifiAttemptActive = false;
-    wifiFallbackActive = true;
-    wifiWasConnected = false;
-    mqttNet.stop();
-    server.stop();
-    networkServicesStarted = false;
-    if (recoveryMode) configureRecoveryRoutes();
-    else configureWebRoutes();
-    startCredentialAccessPoint(true);
-}
-
+// Router unavailability must never force an already-provisioned device into AP.
+// Provisioning still starts AP when credentials are absent; FLASH opens AP manually.
 void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     if (!wifiAttemptActive) return; // Only one terminal result per explicit attempt.
     wifiAttemptActive = false;
@@ -3955,8 +4013,12 @@ void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     wifiFallbackFailureKind = kind;
     wifiFallbackReason = reason;
     wifiFallbackStatus = status;
+    // Permit retry power escalation only within 15 dBm.
+    if (wifiTxCurrentLevel < WIFI_TX_LAST_LEVEL)
+        wifiTxRetryFloor = wifiTxCurrentLevel == 0 ? 2 : WIFI_TX_LAST_LEVEL;
+    if (wifiRetryStep + 1 < WIFI_RETRY_STEP_COUNT) ++wifiRetryStep;
     lastWifiRetry = millis();
-    if (wifiConsecutiveFailures >= WIFI_MAX_FAILED_ATTEMPTS) enterWiFiFallback();
+    // Deliberately no enterWiFiFallback(): stay in STA and retry indefinitely.
 }
 
 void startTrackedWiFiAttempt() {
@@ -3978,12 +4040,51 @@ void startTrackedWiFiAttempt() {
         return;
     }
     WiFi.setAutoReconnect(false);
+    // Fail closed when requested TX ceiling cannot be installed.
+    if (!wifiTxApply(0, "preconnect safe limit")) {
+        finishWiFiAttemptFailure(6, 0, (int)WiFi.status());
+        return;
+    }
     const IPAddress localIp(192, 168, 1, configuredStaOctet);
     const IPAddress gateway(192, 168, 1, 1), subnet(255, 255, 255, 0);
     if (!WiFi.config(localIp, gateway, subnet, gateway)) {
         finishWiFiAttemptFailure(4, 0, (int)WiFi.status());
         return;
     }
+    // The scan is asynchronous; do not delay local sensor and web service.
+    wifiTxScanning = true;
+    wifiTxScanStartedMs = millis();
+    ++wifiTxScanCount;
+    const int scanStart = WiFi.scanNetworks(true, true, false, 120);
+    if (scanStart != WIFI_SCAN_RUNNING)
+        wifiTxScanStartedMs = millis() - WIFI_TX_SCAN_TIMEOUT_MS;
+}
+
+void serviceWifiTxPrescan(unsigned long now) {
+    if (!wifiTxScanning) return;
+    int count = WiFi.scanComplete();
+    if (count == WIFI_SCAN_RUNNING &&
+        (uint32_t)(now - wifiTxScanStartedMs) < WIFI_TX_SCAN_TIMEOUT_MS) return;
+    if (count == WIFI_SCAN_RUNNING) {
+        (void)esp_wifi_scan_stop();
+        count = WiFi.scanComplete();
+    }
+    wifiTxLastPreconnectRssi = -127;
+    for (int i = 0; i < count; ++i) {
+        if (WiFi.SSID(i) == ssid && (int)WiFi.RSSI(i) > wifiTxLastPreconnectRssi)
+            wifiTxLastPreconnectRssi = (int)WiFi.RSSI(i);
+    }
+    WiFi.scanDelete();
+    wifiTxScanning = false;
+
+    uint8_t chosen = wifiTxLastPreconnectRssi == -127
+        ? 0 : wifiTxLevelForRssi(wifiTxLastPreconnectRssi);
+    if (chosen < wifiTxRetryFloor) chosen = wifiTxRetryFloor;
+    if (!wifiTxApply(chosen, "preconnect RSSI / bounded retry")) {
+        finishWiFiAttemptFailure(6, 0, (int)WiFi.status());
+        return;
+    }
+    wifiAttemptStartedMs = millis(); // association timeout, excluding scan
     const int result = (int)WiFi.begin(ssid, password);
     if (result == 4 || result == 255) finishWiFiAttemptFailure(5, 0, result);
 }
@@ -4036,6 +4137,10 @@ bool serviceNetworkStackRecovery(unsigned long now) {
 void serviceWiFiReconnect(unsigned long now) {
     servicePendingWiFiDisconnect();
     if (credentialPortalOnly || !ssid[0]) return;
+    if (wifiTxScanning) {
+        serviceWifiTxPrescan(now);
+        return;
+    }
     if (WiFi.status() == WL_CONNECTED) {
         if (!wifiWasConnected) {
             lastMqttReconnectMs = 0;
@@ -4052,6 +4157,14 @@ void serviceWiFiReconnect(unsigned long now) {
         wifiRetryStep = 0;
         wifiOfflineSinceMs = 0;
         wifiLastDisconnectReason = 0;
+        wifiTxRetryFloor = 0;
+        if ((uint32_t)(now - wifiTxLastAdjustedMs) >= WIFI_TX_REEVALUATE_MS) {
+            const uint8_t desired = wifiTxLevelForRssi((int)WiFi.RSSI());
+            if (desired != wifiTxCurrentLevel)
+                (void)wifiTxApply(desired, "associated RSSI");
+            else
+                wifiTxLastAdjustedMs = now;
+        }
         return;
     }
     if (wifiWasConnected) {
@@ -4315,12 +4428,13 @@ bool platformWebWriteStatus(WiFiClient& client) {
         "<section class='platform-status'><p><a href='/network-debug'>Network Debug</a>"
         "<a href='/setup'>Network Setup</a></p>");
     if (!writeRootProgmemViaRam(client, links, strlen_P(links))) return false;
-    char line[192];
+    char line[256];
     const int n = snprintf_P(line, sizeof(line),
-        PSTR("<pre>Wi-Fi: %s\nMQTT: %s\nRSSI: %d dBm\nFree heap: %lu bytes</pre></section>"),
+        PSTR("<pre>Wi-Fi: %s\nMQTT: %s\nRX RSSI: %d dBm\nTX max: %.1f dBm (configured, not measured)\nAdaptive TX cap: 15.0 dBm\nFree heap: %lu bytes</pre></section>"),
         WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE",
         mqttClient.connected() ? "CONNECTED" : "DISCONNECTED",
-        (int)WiFi.RSSI(), (unsigned long)ESP.getFreeHeap());
+        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+        (double)wifiTxTenths() / 10.0, (unsigned long)ESP.getFreeHeap());
     return n > 0 && n < (int)sizeof(line) &&
         writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n);
 }
