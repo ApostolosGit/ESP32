@@ -4,9 +4,8 @@
 // implementation and profile at the marked integration points below.
 // Baseline: EnergyMeter 5.58 behavior, cleaned source commit 0c874d3 (5.59).
 // Boiler v4.04: adaptive Wi-Fi TX and AP+STA recovery; CommonPlatform v1.06.
-// U8g2 has no native CH1116 constructor; this alternate test uses SSD1309 init.
-// Older v4.01 used SH1106 init. CH1116 + SSD1309 initialization is confirmed on the user's panel.
-// 1.54-inch CH1116 128x64, GPIO3 SDA / GPIO4 SCL; preserve OTA and recovery services.
+// OLED profile for USB testing: SSD1309 1.3-inch I2C 128x64 (GPIO3 SDA / GPIO4 SCL).
+// Keep OLED_TYPE 3 support in Common Platform for CH1116 1.54-inch installations.
 // OLED hardware map for these installations (128x64 I2C):
 //   OLED_TYPE 3 = CH1116 1.54-inch; U8g2 SSD1309 init (tested on the user's panel).
 //   OLED_TYPE 2 = SSD1309 1.3-inch; OLED_TYPE 1 = legacy SH1106; 0 = none.
@@ -25,7 +24,7 @@
 #define OTA_PROFILE_PREFIX "esp32c3-boiler-4ds18b20"
 #define MQTT_TOPIC_PREFIX "home/energy/"
 #ifndef OLED_TYPE
-#define OLED_TYPE 3  // CH1116 1.54-inch 128x64 I2C; SSD1309-compatible init.
+#define OLED_TYPE 2  // SSD1309 1.3-inch 128x64 I2C, GPIO3 SDA / GPIO4 SCL.
 #endif
 #define PLATFORM_OTA_FILENAME_PREFIX "Boiler_ESP32C3_V"
 #define PLATFORM_OTA_FILENAME_SUFFIX ".bin"
