@@ -3,7 +3,7 @@
 // Application generation inserts only the selected application's declarations,
 // implementation and profile at the marked integration points below.
 // Baseline: EnergyMeter 5.58 behavior, cleaned source commit 0c874d3 (5.59).
-// Boiler v4.04: adaptive Wi-Fi TX / no automatic AP on router outage; CommonPlatform v1.06.
+// Boiler v4.04: adaptive Wi-Fi TX and AP+STA recovery; CommonPlatform v1.06.
 // U8g2 has no native CH1116 constructor; this alternate test uses SSD1309 init.
 // Older v4.01 used SH1106 init. CH1116 + SSD1309 initialization is confirmed on the user's panel.
 // 1.54-inch CH1116 128x64, GPIO3 SDA / GPIO4 SCL; preserve OTA and recovery services.
@@ -4047,8 +4047,8 @@ void servicePendingWiFiDisconnect() {
     }
 }
 
-// Router unavailability must never force an already-provisioned device into AP.
-// Provisioning still starts AP when credentials are absent; FLASH opens AP manually.
+// After three router failures, open temporary AP+STA for local access.
+// Continue STA retries; automatic AP closes when STA reconnects. FLASH keeps manual AP.
 void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     if (!wifiAttemptActive) return; // Only one terminal result per explicit attempt.
     wifiAttemptActive = false;
