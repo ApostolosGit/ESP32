@@ -4030,8 +4030,8 @@ void servicePendingWiFiDisconnect() {
     }
 }
 
-// Router unavailability must never force an already-provisioned device into AP.
-// Provisioning still starts AP when credentials are absent; FLASH opens AP manually.
+// After three router failures, open temporary AP+STA for local access.
+// Continue STA retries; automatic AP closes when STA reconnects. FLASH keeps manual AP.
 void finishWiFiAttemptFailure(uint8_t kind, uint16_t reason, int status) {
     if (!wifiAttemptActive) return; // Only one terminal result per explicit attempt.
     wifiAttemptActive = false;
