@@ -1,4 +1,13 @@
-# ESP32 Display2.8 — Energy Monitor (MQTT)
+# ESP32 Display2.8 — Energy Monitor (MQTT) · ver0.01
+
+**Τρέχουσα έκδοση: `ver0.01` (08/11/2026).** Η έκδοση εμφανίζεται στην οθόνη και στο Serial Monitor (115200 baud).
+
+## Ιστορικό εκδόσεων
+
+- **ver0.01** — Πρώτη έκδοση του Energy Monitor με καρτέλες Αρτέμιδα, Νέστου 5Α, VENT και BOILER, ανάγνωση MQTT και αρχική ρύθμιση Wi-Fi/HiveMQ. Επιτυχής μεταγλώττιση· απαιτείται επιβεβαίωση πάνω στη φυσική συσκευή.
+
+Σε κάθε επόμενη αλλαγή η έκδοση στο `#define FW_VERSION` θα αυξάνεται σε `ver0.02`, `ver0.03` κ.ο.κ. Η αυτοματοποιημένη μεταγλώττιση δημιουργεί το τρέχον `Display2.8.bin` και ξεχωριστό αρχείο `Display2.8-ver0.01.bin` (για αυτή την έκδοση), ώστε να μην χάνεται το παλαιότερο BIN.
+
 
 Working **compile-tested**, not yet verified on physical hardware. For the **ESP32-2432S028 dual-USB**, ST7789, XPT2046, 4 MB flash, 320×240 landscape.
 
@@ -34,6 +43,7 @@ The Wi-Fi AP uses WPA2 and shuts down after setup. Credentials are saved in ESP3
 | --- | --- |
 | `Display2.8.ino` | Arduino sketch with display, touch, provisioning and MQTT |
 | `TrustedCA.h` | Public ISRG Root X1 CA (not a secret) |
+| `Display2.8-ver0.01.bin` | Στιγμιότυπο πλήρους firmware της έκδοσης ver0.01, στην ίδια διεύθυνση `0x000000` |
 | `Display2.8.bin` | Full merged image: bootloader + partitions + application, flash at `0x000000` |
 | `Display2.8-app-only.bin` | Application only, offset `0x10000` **only if existing partition table is compatible** |
 | `.github/workflows/build-display28.yml` | Automatic compile and commit of binaries |
