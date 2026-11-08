@@ -75,6 +75,7 @@ bool mqttSubs[3]={false,false,false};
 uint32_t lastTouchRawX=0,lastTouchRawY=0;
 uint32_t nextProbeAt[4]={0,0,0,0};
 uint32_t nextSubRetryAt=0;
+bool live(int pg); // Forward declaration: settings JSON is above rendering code
 void requestAll(); // Settings UI and MQTT callback can schedule polling
 
 
@@ -449,7 +450,7 @@ void topbar() {
 void footer() {
   lcd->fillRect(0,226,320,14,UI_BG);
   if(settingsOpen) {
-    txt(7,231,"SETTINGS / GEAR TO RETURN",UI_MUTED,1);
+    txt(7,231,settingsPane==2?"TAP DEVICE ROW / GEAR BACK":"SETTINGS / GEAR TO RETURN",UI_MUTED,1);
     return;
   }
   uint16_t c=live(currentPage)?UI_GREEN:UI_MUTED;
@@ -635,7 +636,7 @@ void settingsPage() {
       txt(177,y+16,"S"+String(d.statusCount)+" H"+String(d.healthCount)+
           " D"+String(d.stateCount),UI_MUTED,1);
     }
-    txt(9,218,"Tap row: device tab",UI_MUTED,1);
+    // Each device card is touch-selectable; footer explains the action.
   } else {
     txt(8,67,"SYSTEM DEBUG",UI_CYAN,2);
     card(4,88,312,136);
@@ -701,16 +702,27 @@ void registerWebRoutes() {
   webServer.collectHeaders(headers,1);
   webServer.on("/ap-login",HTTP_POST,handleApWebLogin);
   webServer.on("/health",HTTP_GET,[](){
-    // CommonPlatform: every AP page/action is PIN-protected while the AP is active.
     if(portalActive && !requireApWebPin())return;
     webServer.sendHeader("Cache-Control","no-store");
     webServer.send(200,"application/json; charset=utf-8",jsonStatus());
+  });
+  webServer.on("/network-debug",HTTP_GET,[](){
+    if(portalActive && !requireApWebPin())return;
+    webServer.sendHeader("Cache-Control","no-store");
+    webServer.send(200,"application/json; charset=utf-8",jsonStatus());
+  });
+  webServer.on("/mqtt-status",HTTP_GET,[](){
+    if(portalActive && !requireApWebPin())return;
+    webServer.sendHeader("Cache-Control","no-store");
+    webServer.send(200,"application/json; charset=utf-8",mqttDebugJson());
   });
   webServer.on("/",HTTP_GET,[](){
     if(!portalActive) {
       webServer.send(200,"text/html; charset=utf-8",
         "<h3>Energy Monitor "+String(FW_VERSION)+
-        "</h3><p>Read-only dashboard</p><a href='/health'>Health</a>");
+        "</h3><p>Read-only dashboard</p>"
+        "<p><a href='/network-debug'>Network Debug</a> | "
+        "<a href='/mqtt-status'>MQTT / Devices Debug</a></p>");
       return;
     }
     if(!requireApWebPin())return;
@@ -723,7 +735,9 @@ void registerWebRoutes() {
     h+="HiveMQ user<br><input name='user' maxlength='64' required><br>HiveMQ password<br><input name='mpass' type='password' maxlength='64' required><br>";
     h+="Price (euro/kWh)<br><input name='price' value='0.25'><br><br>";
     h+="<button type='submit'>Save & restart</button></form>";
-    h+="<p><a href='/health'>Health JSON</a> | <a href='/ota'>Local OTA update</a></p>";
+    h+="<p><a href='/network-debug'>Network Debug</a> | ";
+    h+="<a href='/mqtt-status'>MQTT / Devices Debug</a> | ";
+    h+="<a href='/ota'>Local OTA update</a></p>";
     h+="<p>OTA requires <b>Display2.8-app-only.bin</b>, not the full merged BIN.</p>";
     h+="</body></html>";
     webServer.sendHeader("Cache-Control","no-store");
@@ -831,7 +845,7 @@ void beginPortal(bool recovery=false) {
   apDnsRunning=true;
   Serial.printf("[AP] OPEN, PIN 12134, %s at http://%s\n",
     recovery?"AP+STA recovery":"AP-only setup",WiFi.softAPIP().toString().c_str());
-  drawSetup();
+  if(settingsOpen)render();else drawSetup();
 }
 void servicePortal() {
   if(portalActive) {
@@ -1117,13 +1131,47 @@ void handleTouch() {
   held=true;
   TS_Point p=touch.getPoint();
   if(p.z<100)return;
+  lastTouchRawX=p.x;lastTouchRawY=p.y;
   int x=constrain((int)map(p.x,250,3800,0,319),0,319);
   int y=constrain((int)map(p.y,250,3800,0,239),0,239);
-  Serial.printf("Touch %d,%d -> %d,%d\n",p.x,p.y,x,y);
-  if(portalActive)return; // Do not obscure the AP instructions during setup.
+  Serial.printf("[TOUCH] raw=(%d,%d) -> (%d,%d)\n",p.x,p.y,x,y);
+  // Persistent settings gear in the top-right corner, even in AP setup mode.
+  if(x>=287 && y<=30) {
+    settingsOpen=!settingsOpen;
+    if(settingsOpen) {
+      settingsPane=0;render();
+    } else if(portalActive)drawSetup();
+    else render();
+    return;
+  }
+  if(settingsOpen) {
+    if(y>=29 && y<=63) {
+      uint8_t pane=constrain(x/80,0,3);
+      if(settingsPane!=pane){settingsPane=pane;render();}
+      return;
+    }
+    if(settingsPane==1 && x>=205 && y>=190 && y<=222) {
+      requestAll();render();return;
+    }
+    if(settingsPane==2 && y>=84 && y<223) {
+      int n=(y-84)/35;
+      if(n>=0 && n<4) {
+        currentPage=n;settingsOpen=false;
+        if(!live(n))requestDevice(n,true);
+        render();
+      }
+      return;
+    }
+    return;
+  }
+  if(portalActive)return; // Keep the AP instructions on-screen except for gear.
   if(y>=29 && y<=64) {
     int newPage=constrain(x/80,0,3);
-    if(currentPage!=newPage) {currentPage=newPage;render();}
+    if(currentPage!=newPage) {
+      currentPage=newPage;
+      if(!live(newPage))requestDevice(newPage,false);
+      render();
+    }
   }
 }
 void setup() {
@@ -1188,6 +1236,8 @@ void loop() {
       portalForced=true;beginPortal(wifiSsid.length()>0);
     } else if(cmd=="STATUS") {
       Serial.println(jsonStatus());
+    } else if(cmd=="MQTT") {
+      Serial.println(mqttDebugJson());
     }
   }
   if(routesReady)webServer.handleClient();
@@ -1196,10 +1246,13 @@ void loop() {
     if(!portalActive && !portalRetryAt && dueAt(nextWifiAttempt)) {
       nextWifiAttempt=millis()+30000;beginPortal(false);
     }
+    handleTouch(); // The gear works on the setup screen too.
+    if(settingsOpen && millis()-lastDraw>10000UL)render();
     delay(10);return;
   }
   maintainConnection();
   handleTouch();
+  serviceDeviceProbes();
   if(mqtt.connected() && millis()-lastPoll>60000UL)requestAll();
   if(millis()-lastDraw>10000UL && !portalActive)render();
   if(millis()-lastHealthLine>60000UL) {
