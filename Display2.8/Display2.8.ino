@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.05 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.06 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.05"
+#define FW_VERSION "ver0.06"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -57,6 +57,24 @@ String ids[4];
 bool hasState[4] = {false,false,false,false};
 StaticJsonDocument<6144> state[4];
 StaticJsonDocument<6144> incomingState; // Global: avoid 6 KB stack allocation in MQTT callback
+
+// Live MQTT source diagnostics, including retained status/health topics.
+// These are OBSERVED frames; no synthetic sensor values are generated.
+struct SourceDebug {
+  uint32_t statusAt=0,healthAt=0,stateAt=0,requestAt=0;
+  uint32_t statusCount=0,healthCount=0,stateCount=0,requests=0,requestFails=0;
+  bool statusKnown=false,statusOnline=false;
+};
+SourceDebug sourceDebug[4];
+bool settingsOpen=false;
+uint8_t settingsPane=0;
+uint32_t mqttPackets=0,mqttJsonErrors=0,mqttUnknown=0,mqttRequestTotal=0;
+uint32_t lastMqttPacketAt=0;
+char lastMqttTopic[100]={0},lastMqttError[55]={0},lastUnknownTopic[100]={0};
+bool mqttSubs[3]={false,false,false};
+uint32_t lastTouchRawX=0,lastTouchRawY=0;
+void requestAll(); // Settings UI and MQTT callback can schedule polling
+
 
 // CommonPlatform 1.06-compatible network lifecycle for classic ESP32.
 // Deliberately NOT the C3-only platform source (target-specific adapters differ).
@@ -143,6 +161,14 @@ String jsonStatus() {
   j["mqtt_reconnect_attempts"]=mqttReconnects;
   j["wifi_failures"]=wifiFailures;j["mqtt_failures"]=mqttFailures;
   j["ota_profile"]=OTA_PROFILE_ID;
+  j["mqtt_packets"]=mqttPackets;
+  j["mqtt_json_errors"]=mqttJsonErrors;
+  j["mqtt_unknown_topics"]=mqttUnknown;
+  j["mqtt_requests"]=mqttRequestTotal;
+  j["mqtt_last_topic"]=lastMqttTopic;
+  j["mqtt_last_error"]=lastMqttError;
+  j["mqtt_sub_state"]=mqttSubs[0];j["mqtt_sub_status"]=mqttSubs[1];
+  j["mqtt_sub_health"]=mqttSubs[2];
   JsonArray ages=j.createNestedArray("measurement_age_sec");
   for(int i=0;i<4;i++)ages.add(hasState[i]?(millis()-lastRx[i])/1000UL:-1);
   String out;serializeJson(j,out);return out;
@@ -353,24 +379,45 @@ void line(int x,int y,const String &label,const String &value,
   txt(x,y,label,UI_MUTED,1);
   txt(x+103,y-3,value,valueColor,2);
 }
+// A small drawn gear is always present, including the AP setup screen.
+void drawGear() {
+  const int cx=305,cy=14;
+  lcd->fillRoundRect(291,1,28,27,5,settingsOpen?UI_ACTIVE:UI_TABOFF);
+  lcd->drawCircle(cx,cy,6,UI_WHITE);
+  lcd->drawCircle(cx,cy,2,UI_CYAN);
+  for(int i=0;i<8;i++) {
+    const float a=i*0.785398163f;
+    int x1=cx+(int)roundf(cosf(a)*8.0f),y1=cy+(int)roundf(sinf(a)*8.0f);
+    int x2=cx+(int)roundf(cosf(a)*10.0f),y2=cy+(int)roundf(sinf(a)*10.0f);
+    lcd->drawLine(x1,y1,x2,y2,UI_WHITE);
+  }
+}
 void topbar() {
   lcd->fillScreen(UI_BG);
   txt(7,3,"ENERGY MONITOR",UI_CYAN,2);
   txt(232,4,FW_VERSION,UI_CYAN,1);
-  txt(285,17,mqtt.connected()?"MQTT":"OFF",mqtt.connected()?UI_GREEN:UI_RED,1);
+  txt(248,18,mqtt.connected()?"MQTT":"OFF",mqtt.connected()?UI_GREEN:UI_RED,1);
   const String tabNames[4]={"ΑΡΤΕΜΙΔΑ","ΝΕΣΤΟΥ 5Α","VENT","BOILER"};
+  const String debugNames[4]={"NET","MQTT","DEV","SYS"};
   for(int i=0;i<4;i++) {
     int x=i*80+2;
-    lcd->fillRoundRect(x,29,76,31,5,(currentPage==i)?UI_ACTIVE:UI_TABOFF);
-    txt(x+3,40,tabNames[i],UI_WHITE,1);
+    bool selected=settingsOpen?(settingsPane==i):(currentPage==i);
+    lcd->fillRoundRect(x,29,76,31,5,selected?UI_ACTIVE:UI_TABOFF);
+    txt(x+4,40,settingsOpen?debugNames[i]:tabNames[i],UI_WHITE,1);
   }
+  drawGear();
 }
 void footer() {
-  uint16_t c=live(currentPage)?UI_GREEN:UI_MUTED;
-  String s=live(currentPage)?"LIVE":"ΑΝΑΜΟΝΗ ΔΕΔΟΜΕΝΩΝ";
   lcd->fillRect(0,226,320,14,UI_BG);
-  txt(7,231,s,c,1);
-  if(live(currentPage)) txt(248,231,String((millis()-lastRx[currentPage])/1000)+"s",UI_MUTED,1);
+  if(settingsOpen) {
+    txt(7,231,"SETTINGS / GEAR TO RETURN",UI_MUTED,1);
+    return;
+  }
+  uint16_t c=live(currentPage)?UI_GREEN:UI_MUTED;
+  String m=live(currentPage)?"LIVE":(sourceDebug[currentPage].statusKnown &&
+    !sourceDebug[currentPage].statusOnline?"OFFLINE":"ΑΝΑΜΟΝΗ ΔΕΔΟΜΕΝΩΝ");
+  txt(7,231,m,c,1);
+  if(live(currentPage)) txt(255,231,String((millis()-lastRx[currentPage])/1000)+"s",UI_MUTED,1);
 }
 void ddsPage() {
   txt(8,65,"ΜΕΤΡΗΤΗΣ ΔΕΗ ΑΡΤΕΜΙΔΑ",UI_WHITE,1);
@@ -479,13 +526,103 @@ void boilerPage() {
     txt(x+9,y+28,value,disconnected?UI_RED:UI_WHITE,2);
   }
 }
+const char *debugNames[4]={"ΑΡΤΕΜΙΔΑ","ΝΕΣΤΟΥ 5Α","VENT","BOILER"};
+String ageOf(uint32_t stamp) {
+  return stamp?String((millis()-stamp)/1000UL)+"s":"--";
+}
+void settingsPage() {
+  if(settingsPane==0) {
+    txt(8,67,"NETWORK DEBUG",UI_CYAN,2);
+    card(4,87,312,137);
+    txt(11,94,"STA:",UI_MUTED,1);
+    txt(74,94,WiFi.status()==WL_CONNECTED?"CONNECTED":"DISCONNECTED",
+        WiFi.status()==WL_CONNECTED?UI_GREEN:UI_RED,1);
+    txt(11,110,"SSID:",UI_MUTED,1);
+    txt(74,110,wifiSsid.substring(0,37),UI_WHITE,1);
+    txt(11,126,"IP:",UI_MUTED,1);
+    txt(74,126,localIp(),UI_WHITE,1);
+    txt(11,142,"GATEWAY:",UI_MUTED,1);
+    txt(74,142,WiFi.status()==WL_CONNECTED?WiFi.gatewayIP().toString():"--",UI_WHITE,1);
+    txt(11,158,"RSSI:",UI_MUTED,1);
+    txt(74,158,WiFi.status()==WL_CONNECTED?String(WiFi.RSSI())+" dBm":"--",UI_WHITE,1);
+    txt(170,158,"TX:",UI_MUTED,1);
+    txt(204,158,txPowerVerified?String(TX_TENTHS[txLevel]/10)+"."+
+        String(TX_TENTHS[txLevel]%10)+" dBm":"ERR",txPowerVerified?UI_GREEN:UI_RED,1);
+    txt(11,174,"AP:",UI_MUTED,1);
+    txt(74,174,portalActive?"OPEN / PIN":"OFF",portalActive?UI_YELLOW:UI_MUTED,1);
+    txt(180,174,portalActive?WiFi.softAPIP().toString():"",UI_WHITE,1);
+    txt(11,190,"WiFi RETRY:",UI_MUTED,1);
+    txt(117,190,String(wifiReconnects),UI_WHITE,1);
+    txt(168,190,"FAIL:",UI_MUTED,1);
+    txt(218,190,String(wifiFailures),UI_RED,1);
+    txt(11,206,"WEB: /network-debug",UI_CYAN,1);
+  } else if(settingsPane==1) {
+    txt(8,67,"MQTT DEBUG",UI_CYAN,2);
+    card(4,87,312,137);
+    txt(11,94,"MQTT:",UI_MUTED,1);
+    txt(70,94,mqtt.connected()?"CONNECTED":"DISCONNECTED",
+        mqtt.connected()?UI_GREEN:UI_RED,1);
+    txt(11,108,"HOST:",UI_MUTED,1);
+    txt(58,108,broker.substring(0,43),UI_WHITE,1);
+    txt(11,122,"CLIENT:",UI_MUTED,1);
+    txt(65,122,deviceId().substring(0,34),UI_WHITE,1);
+    txt(11,136,"SUB S/H/T:",UI_MUTED,1);
+    txt(92,136,String(mqttSubs[0]?"Y":"N")+"/"+(mqttSubs[1]?"Y":"N")+
+        "/"+(mqttSubs[2]?"Y":"N"),UI_WHITE,1);
+    txt(165,136,"STATE:",UI_MUTED,1);
+    txt(215,136,String(mqtt.state()),UI_WHITE,1);
+    txt(11,150,"RX:",UI_MUTED,1);
+    txt(50,150,String(mqttPackets),UI_WHITE,1);
+    txt(115,150,"BAD:",UI_MUTED,1);
+    txt(155,150,String(mqttJsonErrors),UI_RED,1);
+    txt(205,150,"REQ:",UI_MUTED,1);
+    txt(241,150,String(mqttRequestTotal),UI_WHITE,1);
+    txt(11,165,"LAST:",UI_MUTED,1);
+    txt(58,165,String(lastMqttTopic).substring(0,41),UI_WHITE,1);
+    if(lastMqttError[0])txt(11,180,String(lastMqttError).substring(0,48),UI_RED,1);
+    txt(11,195,"/mqtt-status",UI_CYAN,1);
+    lcd->fillRoundRect(208,190,101,27,5,UI_ACTIVE);
+    txt(218,199,"REFRESH",UI_WHITE,1);
+  } else if(settingsPane==2) {
+    txt(8,65,"DEVICE / MQTT FRAMES",UI_CYAN,2);
+    for(int i=0;i<4;i++) {
+      int y=84+i*35;
+      card(4,y,312,32);
+      const SourceDebug &d=sourceDebug[i];
+      txt(9,y+3,debugNames[i],UI_CYAN,1);
+      String condition=live(i)?"LIVE":(d.statusKnown&&!d.statusOnline?"OFF":"WAIT");
+      txt(245,y+3,condition,live(i)?UI_GREEN:(d.statusKnown&&!d.statusOnline?UI_RED:UI_YELLOW),1);
+      txt(9,y+16,ids[i].length()?ids[i].substring(0,25):"ID UNKNOWN",UI_WHITE,1);
+      txt(177,y+16,"S"+String(d.statusCount)+" H"+String(d.healthCount)+
+          " D"+String(d.stateCount),UI_MUTED,1);
+    }
+    txt(9,218,"Tap row: device tab",UI_MUTED,1);
+  } else {
+    txt(8,67,"SYSTEM DEBUG",UI_CYAN,2);
+    card(4,88,312,136);
+    txt(11,95,"FIRMWARE:",UI_MUTED,1);txt(107,95,FW_VERSION,UI_WHITE,1);
+    txt(11,111,"CHIP:",UI_MUTED,1);txt(107,111,"ESP32-D0WD",UI_WHITE,1);
+    txt(11,127,"UPTIME:",UI_MUTED,1);txt(107,127,String(millis()/1000UL)+" sec",UI_WHITE,1);
+    txt(11,143,"HEAP:",UI_MUTED,1);txt(107,143,String(ESP.getFreeHeap())+" bytes",UI_WHITE,1);
+    txt(11,159,"BLOCK:",UI_MUTED,1);txt(107,159,String(heap_caps_get_largest_free_block(
+        MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT))+" bytes",UI_WHITE,1);
+    txt(11,175,"NTP:",UI_MUTED,1);txt(107,175,time(nullptr)>1600000000?"SYNCED":"WAIT",UI_WHITE,1);
+    txt(11,191,"RESET:",UI_MUTED,1);txt(107,191,String((int)esp_reset_reason()),UI_WHITE,1);
+    txt(11,207,"TOUCH:",UI_MUTED,1);
+    txt(107,207,String(lastTouchRawX)+","+String(lastTouchRawY),UI_WHITE,1);
+  }
+}
 void render() {
   topbar();
-  switch(currentPage) {
-    case 0:ddsPage();break;
-    case 1:jsyPage();break;
-    case 2:ventPage();break;
-    case 3:boilerPage();break;
+  if(settingsOpen) {
+    settingsPage();
+  } else {
+    switch(currentPage) {
+      case 0:ddsPage();break;
+      case 1:jsyPage();break;
+      case 2:ventPage();break;
+      case 3:boilerPage();break;
+    }
   }
   footer();
   lastDraw=millis();
@@ -500,6 +637,7 @@ void drawStartupStage(const String &stage, bool error=false) {
   txt(10,146,"LCD: ST7789 320x240",UI_MUTED,1);
   txt(10,165,"Touch: XPT2046",UI_MUTED,1);
   txt(10,204,error?"Retrying AP automatically":"Boot diagnostics at 115200",UI_CYAN,1);
+  drawGear();
   Serial.printf("[DISPLAY] %s%s\n",error?"ERROR ":"",stage.c_str());
 }
 void drawSetup() {
@@ -513,6 +651,7 @@ void drawSetup() {
   txt(14,166,"Open browser:",UI_WHITE,1);
   txt(14,184,"http://"+WiFi.softAPIP().toString(),UI_CYAN,2);
   txt(14,217,"No credentials on GitHub",UI_MUTED,1);
+  drawGear();
 }
 // CommonPlatform 1.06 open-AP PIN with a 15-minute scoped cookie session.
 // While the portal is active, all HTTP pages and actions require authentication.
