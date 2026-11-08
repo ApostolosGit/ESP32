@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.04 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.05 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.04"
+#define FW_VERSION "ver0.05"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -29,6 +29,7 @@
 #include <math.h>
 #include <Update.h>
 #include <esp_heap_caps.h>
+#include <esp_wifi.h> // Native API: TX power limit after radio start
 #include "TrustedCA.h"
 
 Arduino_DataBus *db = new Arduino_ESP32SPI(2, 15, 14, 13, 12);
@@ -74,6 +75,8 @@ uint32_t wifiFailures=0, mqttFailures=0, wifiReconnects=0, mqttReconnects=0;
 uint32_t disconnectedSince=0, nextWifiAttempt=0, nextMqttAttempt=0;
 uint32_t lastTxTune=0, lastHealthLine=0, lastNtpAttempt=0;
 uint8_t wifiRetryIdx=0, mqttRetryIdx=0, txLevel=0;
+bool txPowerVerified=false;
+int32_t lastTxError=0;
 
 const wifi_power_t TX_STEPS[] = {WIFI_POWER_8_5dBm, WIFI_POWER_11dBm,
                                 WIFI_POWER_13dBm, WIFI_POWER_15dBm};
@@ -84,13 +87,30 @@ const uint32_t MQTT_RUN_RETRY_MS[] = {5000,10000,30000};
 bool dueAt(uint32_t target) {return (int32_t)(millis()-target)>=0;}
 String deviceId() {return String(DEVICE_ID_PREFIX)+String((uint32_t)ESP.getEfuseMac(),HEX);}
 bool setTxLevel(uint8_t level,const char *reason) {
-  if(level>3)level=3; // Hardware cap: 15.0 dBm, NEVER a higher enum.
-  if(!WiFi.setTxPower(TX_STEPS[level])) {
-    Serial.printf("[TX] setTxPower failed: %s\n",reason);return false;
+  if(level>3)level=3; // 15 dBm max, as CommonPlatform v1.06.
+  const int8_t desired=(int8_t)TX_STEPS[level]; // IDF units: quarter-dBm
+  esp_err_t err=ESP_FAIL;
+  // IDF requires Wi-Fi to have *started*; mode() alone can race the START event.
+  // Do not use Arduino WiFi.setTxPower() before a running STA/AP interface.
+  for(uint8_t tryNo=0;tryNo<12;tryNo++) {
+    err=esp_wifi_set_max_tx_power(desired);
+    if(err==ESP_OK)break;
+    if(tryNo<11)delay(50);
   }
-  txLevel=level;lastTxTune=millis();
-  Serial.printf("[TX] requested max %d.%d dBm (%s)\n",
-                TX_TENTHS[level]/10,TX_TENTHS[level]%10,reason);
+  int8_t confirmed=0;
+  esp_err_t readErr=(err==ESP_OK)?esp_wifi_get_max_tx_power(&confirmed):err;
+  lastTxError=(err==ESP_OK)?(int32_t)readErr:(int32_t)err;
+  if(err!=ESP_OK || readErr!=ESP_OK || confirmed>desired) {
+    txPowerVerified=false;
+    Serial.printf("[TX] FAILED %s: set=%s(0x%X) get=%s(0x%X) actual=%d desired=%d\n",
+                  reason,esp_err_to_name(err),(unsigned)err,
+                  esp_err_to_name(readErr),(unsigned)readErr,
+                  (int)confirmed,(int)desired);
+    return false;
+  }
+  txLevel=level;txPowerVerified=true;lastTxTune=millis();
+  Serial.printf("[TX] verified limit %d.%d dBm (actual %d/4 dBm, %s)\n",
+                TX_TENTHS[level]/10,TX_TENTHS[level]%10,(int)confirmed,reason);
   return true;
 }
 void retuneWifi() {
@@ -109,7 +129,9 @@ String jsonStatus() {
   j["largest_block"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
   j["sta_connected"]=WiFi.status()==WL_CONNECTED;j["sta_ip"]=localIp();
   j["rssi"]=WiFi.status()==WL_CONNECTED?WiFi.RSSI():-127;
-  j["tx_max_tenths_dbm"]=TX_TENTHS[txLevel];
+  j["tx_max_tenths_dbm"]=txPowerVerified?(int)TX_TENTHS[txLevel]:-1;
+  j["tx_verified"]=txPowerVerified;
+  j["tx_last_error"]=lastTxError;
   j["ap_active"]=portalActive;j["mqtt_connected"]=mqtt.connected();
   j["ap_ip"]=portalActive?WiFi.softAPIP().toString():"";
   j["ap_pin_session_sec_left"]=portalActive && apWebSessionToken[0] &&
@@ -601,11 +623,8 @@ void beginPortal(bool recovery=false) {
     drawStartupStage("AP radio mode failed",true);
     return;
   }
-  if(!setTxLevel(0,"portal startup")) {
-    portalFailures++;portalRetryAt=millis()+30000;
-    Serial.println("[TX] Portal disabled until safe TX limit can be set");
-    drawStartupStage("AP TX power failed",true);return;
-  }
+  // Start the radio interface FIRST, then set and read back its TX ceiling.
+  // In ver0.04 the TX call preceded softAP() and failed with NOT_STARTED.
   uint8_t octet=portalOctet();
   IPAddress ip(192,168,2,octet);
   if(!WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) ||
@@ -613,6 +632,15 @@ void beginPortal(bool recovery=false) {
     portalFailures++;portalRetryAt=millis()+30000;
     Serial.println("[AP] open AP start failed; 30s retry");
     drawStartupStage("AP start failed",true);return;
+  }
+  txPowerVerified=false;
+  if(!setTxLevel(0,"AP already started")) {
+    // Fail closed: do not leave an open AP transmitting at an unknown limit.
+    WiFi.softAPdisconnect(true);
+    if(recovery && wifiSsid.length())WiFi.mode(WIFI_STA);
+    portalFailures++;portalRetryAt=millis()+30000;
+    Serial.println("[TX] AP stopped: cannot verify <=15 dBm TX power");
+    drawStartupStage("AP TX verify failed",true);return;
   }
   portalActive=true;
   portalStartMs=millis();
@@ -728,17 +756,22 @@ void requestAll() {
   lastPoll=millis();
 }
 void startStation() {
-  WiFi.mode(portalActive?WIFI_AP_STA:WIFI_STA);
-  // CommonPlatform escalation: start low, raise the max only after failed attempts.
-  // Unlike the C3 implementation this board uses retry-based levels, not pre-scans.
+  if(!WiFi.mode(portalActive?WIFI_AP_STA:WIFI_STA)) {
+    Serial.println("[WiFi] STA radio mode failed");
+    wifiFailures++;nextWifiAttempt=millis()+10000;return;
+  }
+  // The radio is started by WiFi.begin; TX setting is valid only afterwards.
+  // Escalate on subsequent connection attempts, capped at 15 dBm.
   uint8_t target=wifiRetryIdx>3?3:wifiRetryIdx;
-  if(!setTxLevel(target,"before STA begin")) {
-    Serial.println("[WiFi] TX cap failed, no STA connect");
+  WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
+  txPowerVerified=false;
+  if(!setTxLevel(target,"STA started")) {
+    WiFi.disconnect(false,false); // Stop association with an unverified TX cap.
+    Serial.println("[WiFi] TX cap failed; STA attempt stopped");
     nextWifiAttempt=millis()+10000;wifiFailures++;return;
   }
-  WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
   wifiReconnects++;
-  wifiFailures++; // counts timed-out/repeated attempts, not necessarily auth failures.
+  wifiFailures++;
   nextWifiAttempt=millis()+WIFI_RETRY_MS[wifiRetryIdx];
   if(wifiRetryIdx<3)wifiRetryIdx++;
 }
