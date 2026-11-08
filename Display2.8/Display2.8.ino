@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.03 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.04 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.03"
+#define FW_VERSION "ver0.04"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -468,6 +468,18 @@ void render() {
   footer();
   lastDraw=millis();
 }
+// Preserve a readable TFT screen even when AP startup, TLS, or networking fails.
+void drawStartupStage(const String &stage, bool error=false) {
+  lcd->fillScreen(UI_BG);
+  txt(10,9,"ENERGY MONITOR",UI_CYAN,2);
+  txt(252,13,FW_VERSION,UI_CYAN,1);
+  txt(10,68,error?"NETWORK ERROR":"STARTING",error?UI_RED:UI_YELLOW,2);
+  txt(10,105,stage,UI_WHITE,2);
+  txt(10,146,"LCD: ST7789 320x240",UI_MUTED,1);
+  txt(10,165,"Touch: XPT2046",UI_MUTED,1);
+  txt(10,204,error?"Retrying AP automatically":"Boot diagnostics at 115200",UI_CYAN,1);
+  Serial.printf("[DISPLAY] %s%s\n",error?"ERROR ":"",stage.c_str());
+}
 void drawSetup() {
   lcd->fillScreen(UI_BG);
   txt(12,15,"ENERGY MONITOR",UI_CYAN,2);
@@ -583,17 +595,24 @@ void beginPortal(bool recovery=false) {
   ++portalAttempts;
   setupMode=!recovery;
   apSsid="ESP28-SETUP-"+String((uint16_t)ESP.getEfuseMac(),HEX);
-  WiFi.mode(recovery?WIFI_AP_STA:WIFI_AP);
+  drawStartupStage(recovery?"AP+STA RECOVERY":"STARTING OPEN AP");
+  if(!WiFi.mode(recovery?WIFI_AP_STA:WIFI_AP)) {
+    portalFailures++;portalRetryAt=millis()+30000;
+    drawStartupStage("AP radio mode failed",true);
+    return;
+  }
   if(!setTxLevel(0,"portal startup")) {
     portalFailures++;portalRetryAt=millis()+30000;
-    Serial.println("[TX] Portal disabled until safe TX limit can be set");return;
+    Serial.println("[TX] Portal disabled until safe TX limit can be set");
+    drawStartupStage("AP TX power failed",true);return;
   }
   uint8_t octet=portalOctet();
   IPAddress ip(192,168,2,octet);
   if(!WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) ||
      !WiFi.softAP(apSsid.c_str(),nullptr,1,0,4)) {
     portalFailures++;portalRetryAt=millis()+30000;
-    Serial.println("[AP] open AP start failed; 30s retry");return;
+    Serial.println("[AP] open AP start failed; 30s retry");
+    drawStartupStage("AP start failed",true);return;
   }
   portalActive=true;
   portalStartMs=millis();
@@ -809,9 +828,28 @@ void handleTouch() {
 }
 void setup() {
   Serial.begin(115200);
-  Serial.printf("Energy Monitor %s / %s\n",FW_VERSION,COMPAT_PLATFORM);
-  pinMode(21,OUTPUT); digitalWrite(21,HIGH);
-  lcd->begin();lcd->invertDisplay(true);
+  Serial.printf("[BOOT] Energy Monitor %s / %s\n",FW_VERSION,COMPAT_PLATFORM);
+  Serial.printf("[BOOT] Reset reason=%d, heap=%lu\n",
+                (int)esp_reset_reason(),(unsigned long)ESP.getFreeHeap());
+  pinMode(21,OUTPUT);
+  digitalWrite(21,HIGH);
+  delay(50); // Allow display power and SPI lines to settle.
+  bool displayReady=lcd->begin();
+  if(!displayReady) {
+    Serial.println("[BOOT] LCD begin() failed; retry");
+    delay(150);
+    displayReady=lcd->begin();
+  }
+  if(!displayReady) {
+    Serial.println("[BOOT] FATAL: TFT initialization failed");
+    // If LCD initialization failed, stop instead of enabling Wi-Fi over random TFT RAM.
+    while(true)delay(1000);
+  }
+  lcd->invertDisplay(true);
+  lcd->fillScreen(UI_BG);
+  txt(10,10,"ENERGY MONITOR",UI_CYAN,2);
+  txt(10,38,FW_VERSION,UI_WHITE,2);
+  Serial.println("[BOOT] TFT init OK");
   SPI.begin(25,39,32,33);
   touch.begin();touch.setRotation(1);
   readConfig();
@@ -819,13 +857,24 @@ void setup() {
   mqtt.setServer(broker.c_str(),8883);
   mqtt.setBufferSize(12288);
   mqtt.setCallback(mqttMessage);
-  if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
-    beginPortal(false);return;
-  }
-  WiFi.mode(WIFI_STA);
-  registerWebRoutes(); // Local read-only /health; credential POST closed outside portal.
-  startStation();       // Nonblocking; AP+STA fallback after 20 seconds.
+
+  // CRITICAL: display the actual DDS tab before ANY Wi-Fi radio operation.
+  // If AP setup or Wi-Fi initialization fails, the TFT never stays uninitialized.
   render();
+  if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
+    Serial.println("[BOOT] No credentials -> open AP setup");
+    beginPortal(false);
+    return;
+  }
+  if(!WiFi.mode(WIFI_STA)) {
+    Serial.println("[BOOT] Wi-Fi STA mode failed");
+    drawStartupStage("STA radio failed",true);
+    beginPortal(true);
+    return;
+  }
+  registerWebRoutes(); // Read-only /health on LAN; protected config in AP.
+  startStation();       // Nonblocking; AP+STA fallback after 20 seconds.
+  Serial.println("[BOOT] Display and networking initialized");
 }
 void loop() {
   // Serial: PORTAL enters maintenance open AP with CommonPlatform PIN 12134;
