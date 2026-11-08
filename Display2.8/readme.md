@@ -1,51 +1,78 @@
-# ESP32 Display2.8 — Energy Monitor ver0.02
+# ESP32 Display2.8 — Energy Monitor ver0.03
 
-**Hardware:** ESP32-2432S028 dual-USB, classic ESP32-D0WD-V3, 4 MB flash, ST7789 TFT, XPT2046 touch, 320×240 landscape.
+**Board:** ESP32-2432S028 dual USB, classic ESP32-D0WD-V3, 4 MB flash, ST7789 TFT 320×240 and XPT2046 touch.
 
-**Source:** `Display2.8.ino`, supported public TLS certificate: `TrustedCA.h`.
-**Compilation:** GitHub Actions/PlatformIO, succeeds for `esp32dev`; **physical runtime validation is still required**.
+The source is `Display2.8.ino` (with the public CA header `TrustedCA.h`). Github Actions automatically builds a complete merged `Display2.8.bin` and an immutable versioned `Display2.8-ver0.03.bin`. A separate `Display2.8-app-only.bin` is provided for compatible OTA/partition setups.
+
+**Build status:** GitHub Actions/PlatformIO compiled and published ver0.03 successfully. **Physical validation of this new build remains outstanding.**
 
 ## Version history
 
-- **ver0.02 — 08/11/2026:** CommonPlatform v1.06-compatible **classic-ESP32 adapter**: adaptive Wi-Fi TX ceiling (8.5, 11, 13, 15 dBm), nonblocking station reconnect, AP+STA recovery while retrying the router, MQTT boot/runtime backoff, local diagnostics (IP, Wi-Fi RSSI, TX ceiling, heap, NTP, reconnect attempts, stale sample ages), separate provisioning code, and locally authenticated OTA with an **app-only** binary. Retains all four touchscreen tabs and the original MQTT read-only behavior.
-- **ver0.01 — 08/11/2026:** Initial live MQTT dashboard and Wi-Fi setup for the four tabs.
+- **ver0.03 — 08/11/2026:** Adjusted to CommonPlatform v1.06 **open access point, protected web login with PIN `12134` and 15-minute session cookie (`EMSESSION`, HttpOnly, SameSite=Strict)**. Added PIN login, expiry/revocation, attempt lockout, local DNS captive portal, authenticated provisioning and OTA pages/actions, AP health checks/retry, `192.168.2.XX` style AP addressing, adaptive Wi-Fi reconnect TX steps up to **15 dBm**, MQTT transport cleanup on router loss, and NTP initialization after STA association. The four existing measurement tabs remain unchanged.
+- **ver0.02 — 08/11/2026:** Classic-ESP32 adaptation of CommonPlatform's network and service approach: Wi-Fi TX cap, AP+STA recovery, MQTT backoff, `/health` diagnostics, local OTA and provisioning; used a different **WPA-protected AP** and temporary setup code.
+- **ver0.01 — 08/11/2026:** Initial four-tab live MQTT dashboard with first-boot setup.
 
-**Important compatibility boundary:** CommonPlatform v1.06 is designed for ESP32-C3 Super Mini; this display has a classic ESP32, so the code cannot be included verbatim. This version follows relevant networking and recovery principles, **not full source-level or feature-level parity**. It does not implement CommonPlatform's C3-specific RTC crash tracing, its remote MQTT/admin OTA protocol v2, all LittleFS credential migrations, or automatic OTA rollback. Its credentials remain in classic ESP32 Preferences/NVS.
+Versioned full-flash BINs `Display2.8-ver0.01.bin`, `Display2.8-ver0.02.bin` and `Display2.8-ver0.03.bin` are retained beside `Display2.8.ino`. The unversioned `Display2.8.bin` always points to the latest successful build.
 
-## Four tabs
+## AP access — CommonPlatform v1.06 behavior
 
-- **ΑΡΤΕΜΙΔΑ:** `power` (W), `z_diff` (kWh and estimated €), `z_now`, `z_ref`, `utility_date`.
-- **ΝΕΣΤΟΥ 5Α:** three phases `p1`, `p2`, `p3`, total `power_total`; two billing zones (`z1_*` / `z2_*`).
-- **VENT:** outside, inside and intermediate DS18B20; two DHT11 groups (temperature, relative and absolute humidity, feels-like); fan and AUTO/MANUAL, speed and season.
-- **BOILER:** `temp_1` to `temp_4` on GPIO 5/6/7/21; **read-only**.
+1. When Wi-Fi/HiveMQ credentials are missing, the display creates a visible **open Wi-Fi** network called `ESP28-SETUP-XXXX`. **There is no Wi-Fi password.**
+2. Connect to the AP and browse to the **IP shown on the display**. By default it is `http://192.168.2.88` without a known STA address; while in recovery it may use `192.168.2.<STA-octet>`.
+3. The web page prompts for the five-digit **PIN `12134`**. An accepted PIN creates a browser session with a random token and a **15-minute expiry**. After expiry, log in again. Invalid PIN attempts are rate-limited (5 tries → 30 s cooldown).
+4. After successful login, configure local Wi-Fi SSID/password and HiveMQ Cloud username/password. **No Wi-Fi or MQTT credentials are committed to this GitHub repository.** They remain in ESP32 Preferences/NVS in namespace `energy28`, compatible with ver0.01–0.02.
+5. The credentials save endpoint, `/health`, `/ota`, and the upload endpoint all require the browser session **while the AP is active**. The same local web server serves read-only `/health` over the normal LAN when AP mode is off.
+6. If the router is unavailable for about 20 s, an **AP+STA recovery** network opens while the ESP32 continues to retry its router connection. Automatic recovery AP closes after the router returns; a manually forced AP remains open until restart.
 
-Black background, yellow for negative power, red for positive power/energy difference, white readings, cyan titles. Numbers use Greek decimal commas; `--` means unavailable/stale.
+**Important security tradeoff:** The open AP and a fixed, publicly documented PIN match CommonPlatform, as requested, but **HTTP on open Wi-Fi is unencrypted**. Another nearby Wi-Fi client may be able to observe network traffic or attempt access, including setup credentials. Do initial configuration in a trusted physical environment; prefer password-protected setup for stronger protection.
 
-## Flash and OTA — make a backup first
+The firmware uses `192.168.2.XX`-style AP addresses. The generic CommonPlatform C3 uses a configured static STA octet; this Display2.8 board has no reserved static address configured, so the AP uses **88** if no STA IP is known.
 
-The device's **original factory 4 MiB flash backup** must be saved separately before flashing.
+## Display and MQTT
 
-- `Display2.8.bin` and `Display2.8-ver0.02.bin`: **merged bootloader + partition table + app**. Web flasher starting at **`0x000000`**. A merged image may overwrite NVS settings; provision credentials again if lost.
-- `Display2.8-app-only.bin`: **app image only**. For upgrading this specific display **from ver0.01 built with the same default PlatformIO partition table**, flash at **`0x10000`** to keep the existing bootloader and partition table. This is typically less disruptive to NVS, but always keep your backup. **Do not use this offset if the existing partition layout is different.**
-- After initial provisioning, in recovery/maintenance portal, go to `http://192.168.4.1/ota`. For OTA use **only** `Display2.8-app-only.bin`, not a merged `Display2.8.bin`. OTA requires the one-time displayed code as the HTTP Basic password with user `admin`. OTA needs an OTA-capable partition layout and does not provide CommonPlatform v2's complete recovery/rollback protocol.
+All four 320×240 landscape tabs preserve the black-background visual style:
 
-## Credential setup and AP+STA recovery
+- **ΑΡΤΕΜΙΔΑ:** `power`, `z_diff`, `z_now`, `z_ref` and `utility_date` for `Μετρητής ΔΕΗ Αρτέμιδα`.
+- **ΝΕΣΤΟΥ 5Α:** JSY three phase powers `p1`/`p2`/`p3`, signed total power, `z1_*` and `z2_*` estimated/meter differences.
+- **VENT:** DS18B20 temps, inside/outside DHT11 readings and ventilation state.
+- **BOILER:** Four DS18B20 temperatures `temp_1..temp_4` (GPIO 5/6/7/21). **Read-only**, never controls an actuator.
 
-Wi-Fi SSID/password and HiveMQ username/password **must never be committed to this public repository**. Saved local `Preferences` namespace remains `energy28`, compatible with ver0.01.
+MQTT subscribes to `home/energy/+/state`, `/status`, `/health` and publishes **only** `home/energy/<id>/request → update` as a read-request. TLS 8883 uses the trusted CA from `TrustedCA.h`. NTP is needed for certificate validation.
 
-1. If the device has no saved credentials, it creates a temporary `ESP28-SETUP-XXXX` AP and shows the **random AP password and setup code on the screen**. The old fixed `Display28!` AP password from ver0.01 is **no longer used**.
-2. Connect to that AP, open `http://192.168.4.1`, enter the code visible on the screen and configure Wi-Fi/HiveMQ.
-3. If the router is disconnected for more than 20 s, **AP+STA recovery** becomes available while the ESP retries the configured router Wi-Fi; the device will close its recovery AP automatically after a successful reconnection (unless manually forced).
-4. From USB Serial Monitor at 115200 baud, type `STATUS` for local JSON diagnostics, `PORTAL` to open a temporary maintenance AP (credentials remain stored), or `CONFIG` to clear only this device's saved settings and restart. The maintenance AP remains available until reboot.
-5. When connected to the LAN, open `http://<device-IP>/health` to see non-secret diagnostics, including `fw: "ver0.02"`, IP/RSSI, heap and state ages. Configuration and OTA endpoints are closed outside portal mode.
-6. MQTT uses trusted CA and TLS port **8883**, and needs NTP time synchronization. It subscribes to `home/energy/+/state`, `+/status`, `+/health` and sends only periodic `request/update` read requests; **no device actuation**.
+## Firmware flashing
 
-**TX limits:** Requested limit is chosen from 8.5 / 11 / 13 / 15 dBm based on connected RSSI and never above 15 dBm. Initial radio use requests 8.5 dBm. The actual radiated power has not been measured. If firmware cannot install the initial limit, it does not initiate STA connection.
+**Back up the original 4 MiB flash before changing firmware.** The newly built code has not yet been tested on the actual display.
 
-## Libraries and wiring
+| File | Use |
+| --- | --- |
+| `Display2.8-ver0.03.bin` | **Full merged image**, flash **0x000000** in Web ESP Tool |
+| `Display2.8.bin` | Same full merged image, latest version, flash **0x000000** |
+| `Display2.8-app-only.bin` | Application-only update (when partition table is compatible), never at offset 0 |
+| `Display2.8.ino` | Arduino sketch; compile with `TrustedCA.h` |
 
-- LCD: SCK 14, MOSI 13, MISO 12, CS 15, DC 2, backlight 21.
-- Touch XPT2046: SCK 25, MOSI 32, MISO 39, CS 33, IRQ 36.
-- Library versions used by CI: `GFX Library for Arduino@1.4.9`, `XPT2046_Touchscreen`, `PubSubClient@2.8`, `ArduinoJson@6.21.5`, PlatformIO `espressif32@6.10.0`.
+Local OTA is available only while the maintenance/setup AP is open. Sign in with the web PIN and select **exactly** `Display2.8-app-only.bin` on the OTA form. **Do not upload the merged BIN to local OTA.** OTA uses a standard ESP32 OTA partition and is **not** the full CommonPlatform remote MQTT OTA v2 protocol.
 
-Binary build files are published beside the sketch by `.github/workflows/build-display28.yml` and old versioned `Display2.8-ver*.bin` files remain available.
+## USB Serial commands (115200 baud)
+
+- `STATUS`: prints version/connection/heap/age diagnostics.
+- `PORTAL`: forces a temporary AP+STA maintenance portal, preserving credentials.
+- `CONFIG`: clears `energy28` local preferences and restarts into first-boot setup.
+
+`/health` provides device ID, firmware version, Wi-Fi RSSI, TX power cap, IP, MQTT, heap and reconnect attempts. It does not reveal passwords.
+
+## CommonPlatform compatibility boundary
+
+The upstream CommonPlatform v1.06 was written for **ESP32-C3 Super Mini**. This is a **functional adaptation** for classic ESP32-D0WD, not a line-by-line port:
+
+- Implemented: open-AP/PIN web session, captive portal DNS, network retries and AP+STA recovery, capped adaptive TX steps, MQTT TLS/backoff, on-device diagnostics, versioned firmware and local OTA.
+- Not implemented: full C3 RTC crash breadcrumbs and recovery log, CommonPlatform LittleFS credential-record migration/verification, its remote MQTT/admin OTA v2 profile, all C3 hardware/flash-button monitoring, complete recovery rollback and identical static IP provisioning.
+
+For this display **do not flash the C3 CommonPlatform binary**; it targets a different ESP32 chip.
+
+## Firmware build environment
+
+- LCD SPI: CLK 14, MOSI 13, MISO 12, CS 15, DC 2, BL 21.
+- Touch SPI: CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36.
+- PlatformIO `espressif32@6.10.0`; Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient 2.8, ArduinoJson 6.21.5.
+- CI: `.github/workflows/build-display28.yml`.
+
+Always verify the first boot, the AP login, touch handling, reconnect and live MQTT measurements on the physical device before treating firmware as production-ready.
