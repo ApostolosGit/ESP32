@@ -8,7 +8,10 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.01"
+#define FW_VERSION "ver0.02"
+#define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
+#define DEVICE_ID_PREFIX "display28-"
+#define OTA_PROFILE_ID "esp32-display28-st7789"
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -22,6 +25,8 @@
 #include <XPT2046_Touchscreen.h>
 #include <time.h>
 #include <math.h>
+#include <Update.h>
+#include <esp_heap_caps.h>
 #include "TrustedCA.h"
 
 Arduino_DataBus *db = new Arduino_ESP32SPI(2, 15, 14, 13, 12);
@@ -48,6 +53,66 @@ String ids[4];
 bool hasState[4] = {false,false,false,false};
 StaticJsonDocument<6144> state[4];
 StaticJsonDocument<6144> incomingState; // Global: avoid 6 KB stack allocation in MQTT callback
+
+// CommonPlatform 1.06-compatible network lifecycle for classic ESP32.
+// Deliberately NOT the C3-only platform source (target-specific adapters differ).
+bool portalActive=false, portalForced=false, routesReady=false, timeConfigured=false;
+bool wifiEverConnected=false, mqttEverConnected=false, otaImageComplete=false;
+uint32_t wifiFailures=0, mqttFailures=0, wifiReconnects=0, mqttReconnects=0;
+uint32_t disconnectedSince=0, nextWifiAttempt=0, nextMqttAttempt=0;
+uint32_t lastTxTune=0, lastHealthLine=0;
+uint8_t wifiRetryIdx=0, mqttRetryIdx=0, txLevel=0;
+String portalPassword, portalCode;
+const wifi_power_t TX_STEPS[] = {WIFI_POWER_8_5dBm, WIFI_POWER_11dBm,
+                                WIFI_POWER_13dBm, WIFI_POWER_15dBm};
+const uint8_t TX_TENTHS[] = {85,110,130,150};
+const uint32_t WIFI_RETRY_MS[] = {3000,7000,15000,30000};
+const uint32_t MQTT_BOOT_RETRY_MS[] = {10000,30000,60000,120000,300000};
+const uint32_t MQTT_RUN_RETRY_MS[] = {5000,10000,30000};
+bool dueAt(uint32_t target) {return (int32_t)(millis()-target)>=0;}
+String deviceId() {return String(DEVICE_ID_PREFIX)+String((uint32_t)ESP.getEfuseMac(),HEX);}
+bool setTxLevel(uint8_t level,const char *reason) {
+  if(level>3)level=3; // Hardware cap: 15.0 dBm, NEVER a higher enum.
+  if(!WiFi.setTxPower(TX_STEPS[level])) {
+    Serial.printf("[TX] setTxPower failed: %s\n",reason);return false;
+  }
+  txLevel=level;lastTxTune=millis();
+  Serial.printf("[TX] requested max %d.%d dBm (%s)\n",
+                TX_TENTHS[level]/10,TX_TENTHS[level]%10,reason);
+  return true;
+}
+void retuneWifi() {
+  if(WiFi.status()!=WL_CONNECTED || millis()-lastTxTune<60000UL)return;
+  int rssi=WiFi.RSSI();
+  uint8_t target=(rssi>=-66)?0:(rssi>=-74)?1:(rssi>=-81)?2:3;
+  if(target!=txLevel)setTxLevel(target,"RSSI");
+  else lastTxTune=millis();
+}
+String localIp() {return WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():String("--");}
+String jsonStatus() {
+  StaticJsonDocument<1152> j;
+  j["fw"]=FW_VERSION;
+  j["platform_compat"]="1.06";j["chip"]="ESP32-D0WD";j["device_id"]=deviceId();
+  j["uptime_sec"]=millis()/1000UL;j["heap_free"]=ESP.getFreeHeap();
+  j["largest_block"]=heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+  j["sta_connected"]=WiFi.status()==WL_CONNECTED;j["sta_ip"]=localIp();
+  j["rssi"]=WiFi.status()==WL_CONNECTED?WiFi.RSSI():-127;
+  j["tx_max_tenths_dbm"]=TX_TENTHS[txLevel];
+  j["ap_active"]=portalActive;j["mqtt_connected"]=mqtt.connected();
+  j["ntp_ready"]=(time(nullptr)>1600000000);
+  j["wifi_reconnect_attempts"]=wifiReconnects;
+  j["mqtt_reconnect_attempts"]=mqttReconnects;
+  j["wifi_failures"]=wifiFailures;j["mqtt_failures"]=mqttFailures;
+  j["ota_profile"]=OTA_PROFILE_ID;
+  JsonArray ages=j.createNestedArray("measurement_age_sec");
+  for(int i=0;i<4;i++)ages.add(hasState[i]?(millis()-lastRx[i])/1000UL:-1);
+  String out;serializeJson(j,out);return out;
+}
+String makeOneTimeSecret(int chars) {
+  static const char alphabet[]="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  String out;for(int i=0;i<chars;i++)out+=alphabet[esp_random()%(sizeof(alphabet)-1)];
+  return out;
+}
 
 // ---------- Greek uppercase in the built-in 5x7 pixel typeface ----------
 // Map visually identical Greek capitals to Latin, draw remaining glyphs.
@@ -327,46 +392,125 @@ void drawSetup() {
   txt(14,53,"SETUP WIFI + MQTT",UI_YELLOW,2);
   txt(14,88,"Connect to WiFi AP:",UI_WHITE,1);
   txt(14,105,apSsid,UI_CYAN,2);
-  txt(14,136,"PASSWORD: Display28!",UI_WHITE,1);
-  txt(14,166,"Open browser:",UI_WHITE,1);
-  txt(14,184,"http://192.168.4.1",UI_CYAN,2);
+  txt(14,136,"AP PASS: "+portalPassword,UI_WHITE,1);
+  txt(14,153,"SETUP CODE: "+portalCode,UI_YELLOW,1);
+  txt(14,173,"Open browser:",UI_WHITE,1);
+  txt(14,188,"http://192.168.4.1",UI_CYAN,2);
   txt(14,217,"No credentials on GitHub",UI_MUTED,1);
 }
-void beginSetup() {
-  setupMode=true;
-  apSsid="ESP28-SETUP-"+String((uint16_t)ESP.getEfuseMac(),HEX);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(apSsid.c_str(),"Display28!");
+// A local portal requires physical access to the screen for its temporary code.
+// Every POST for configuration, including on the STA interface, requires this code.
+void registerWebRoutes() {
+  if(routesReady)return;
+  routesReady=true;
+  webServer.on("/health",HTTP_GET,[](){
+    webServer.send(200,"application/json; charset=utf-8",jsonStatus());
+  });
   webServer.on("/",HTTP_GET,[](){
+    if(!portalActive) {
+      webServer.send(200,"text/html; charset=utf-8",
+        "<h3>Energy Monitor "+String(FW_VERSION)+"</h3><p>Read-only dashboard</p><a href='/health'>Health</a>");
+      return;
+    }
     String h="<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>";
-    h+="<body style='background:#071321;color:white;font:16px sans-serif'><h2>Energy Monitor 2.8</h2>";
-    h+="<form action='/save' method='post'>";
-    h+="WiFi SSID<br><input name='ssid' required><br>WiFi password<br><input type='password' name='wpass'><br>";
-    h+="HiveMQ host<br><input name='broker' size='42' value='"+String(BROKER_DEFAULT)+"'><br>";
-    h+="HiveMQ user<br><input name='user' required><br>HiveMQ password<br><input name='mpass' type='password' required><br>";
+    h+="<body style='background:#071321;color:white;font:16px sans-serif'><h2>Energy Monitor "+String(FW_VERSION)+"</h2>";
+    h+="<p>CommonPlatform 1.06-compatible local provisioning.</p>";
+    h+="<form action='/save' method='post'>Setup code from display<br><input name='code' required><br>";
+    h+="WiFi SSID<br><input name='ssid' maxlength='32' required><br>WiFi password<br><input type='password' name='wpass' maxlength='64'><br>";
+    h+="HiveMQ host<br><input name='broker' size='38' maxlength='127' value='"+String(BROKER_DEFAULT)+"'><br>";
+    h+="HiveMQ user<br><input name='user' maxlength='64' required><br>HiveMQ password<br><input name='mpass' type='password' maxlength='64' required><br>";
     h+="Price (euro/kWh)<br><input name='price' value='0.25'><br><br>";
-    h+="<button type='submit'>Save & restart</button></form><p>MQTT TLS: 8883. Read-only measurements.</p></body></html>";
+    h+="<button type='submit'>Save & restart</button></form>";
+    h+="<p><a href='/health'>Health JSON</a> | <a href='/ota'>Local OTA update</a></p>";
+    h+="<p>For OTA, use only the <b>Display2.8-app-only.bin</b> file; do not use the merged full BIN.</p>";
+    h+="</body></html>";
     webServer.send(200,"text/html; charset=utf-8",h);
   });
   webServer.on("/save",HTTP_POST,[](){
-    if(!webServer.hasArg("ssid") || !webServer.hasArg("user") ||
-       !webServer.hasArg("mpass") || webServer.arg("ssid").isEmpty()) {
-      webServer.send(400,"text/plain","Missing fields"); return;
+    if(!portalActive || !webServer.hasArg("code") || webServer.arg("code")!=portalCode) {
+      webServer.send(403,"text/plain","Invalid setup code");return;
+    }
+    String ssid=webServer.arg("ssid"),host=webServer.arg("broker"),user=webServer.arg("user");
+    if(!ssid.length() || ssid.length()>32 || host.length()>127 || host.indexOf('/')>=0 ||
+       host.indexOf(':')>=0 || !host.length() || !user.length() || user.length()>64 ||
+       !webServer.arg("mpass").length() || webServer.arg("mpass").length()>64) {
+      webServer.send(400,"text/plain","Invalid configuration");return;
     }
     settings.begin("energy28",false);
-    settings.putString("ssid",webServer.arg("ssid"));
+    settings.putString("ssid",ssid);
     settings.putString("wpass",webServer.arg("wpass"));
-    settings.putString("user",webServer.arg("user"));
+    settings.putString("user",user);
     settings.putString("mpass",webServer.arg("mpass"));
-    settings.putString("broker",webServer.arg("broker"));
-    float p=webServer.arg("price").toFloat();
-    settings.putFloat("price",(p>0.0f && p<10.0f)?p:0.25f);
+    settings.putString("broker",host);
+    float price=webServer.arg("price").toFloat();
+    settings.putFloat("price",(price>0.0f && price<10.0f)?price:0.25f);
     settings.end();
-    webServer.send(200,"text/html","Saved. Device is restarting.");
-    delay(700);ESP.restart();
+    webServer.send(200,"text/html","Saved. Device restarting.");
+    delay(400);ESP.restart();
+  });
+  webServer.on("/ota",HTTP_GET,[](){
+    if(!portalActive) {webServer.send(404,"text/plain","Closed");return;}
+    if(!webServer.authenticate("admin",portalCode.c_str())){webServer.requestAuthentication();return;}
+    webServer.send(200,"text/html; charset=utf-8",
+      "<html><body><h3>Energy Monitor "+String(FW_VERSION)+" — Local OTA</h3>"
+      "<p>Use only <b>Display2.8-app-only.bin</b> (application image), NOT the full merged BIN.</p>"
+      "<form method='POST' action='/update' enctype='multipart/form-data'>"
+      "<input type='file' name='firmware' accept='.bin' required><button type='submit'>Update</button></form></body></html>");
+  });
+  webServer.on("/update",HTTP_POST,[](){
+    if(!portalActive || !webServer.authenticate("admin",portalCode.c_str())) {
+      webServer.requestAuthentication();return;
+    }
+    bool ok=otaImageComplete && !Update.hasError();
+    webServer.send(ok?200:500,"text/plain",ok?"OTA complete - rebooting":"OTA failed, old image retained");
+    if(ok){delay(300);ESP.restart();}
+  },[](){
+    if(!portalActive || !webServer.authenticate("admin",portalCode.c_str()))return;
+    HTTPUpload& u=webServer.upload();
+    if(u.status==UPLOAD_FILE_START) {
+      otaImageComplete=false;
+      if(!u.filename.endsWith(".bin") || !Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))
+        Serial.println("[OTA] begin failed or bad filename");
+    } else if(u.status==UPLOAD_FILE_WRITE) {
+      if(Update.isRunning() && Update.write(u.buf,u.currentSize)!=u.currentSize)
+        Update.abort();
+    } else if(u.status==UPLOAD_FILE_END) {
+      otaImageComplete=Update.isRunning() && Update.end(true);
+    } else if(u.status==UPLOAD_FILE_ABORTED) {
+      Update.abort();otaImageComplete=false;
+    }
   });
   webServer.begin();
+}
+void beginPortal(bool recovery=false) {
+  if(portalActive)return;
+  setupMode=!recovery;
+  portalActive=true;
+  apSsid="ESP28-SETUP-"+String((uint16_t)ESP.getEfuseMac(),HEX);
+  portalPassword=makeOneTimeSecret(12);
+  portalCode=makeOneTimeSecret(8);
+  WiFi.mode(recovery?WIFI_AP_STA:WIFI_AP);
+  if(!setTxLevel(0,"portal startup")) {
+    // Fail closed if a safe transmit-power ceiling cannot be set.
+    portalActive=false;Serial.println("[TX] Portal disabled until safe power set");return;
+  }
+  WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),
+                    IPAddress(255,255,255,0));
+  if(!WiFi.softAP(apSsid.c_str(),portalPassword.c_str())) {
+    portalActive=false;Serial.println("[AP] failed to start");return;
+  }
+  registerWebRoutes();
+  Serial.printf("[AP] %s  URL http://192.168.4.1  (code shown on display)\n",
+                recovery?"AP+STA recovery":"AP-only provisioning");
   drawSetup();
+}
+void stopRecoveryPortal() {
+  if(!portalActive || !wifiSsid.length() || portalForced)return;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalActive=false;
+  setupMode=false;
+  render();
 }
 int typeById(const String &id) {
   String n=id; n.toLowerCase();
@@ -416,7 +560,7 @@ void mqttMessage(char *topic,byte *payload,unsigned int len) {
   }
 }
 void readConfig() {
-  settings.begin("energy28",true);
+  settings.begin("energy28",true); // Keep backwards compatibility with ver0.01 NVS.
   wifiSsid=settings.getString("ssid","");
   wifiPass=settings.getString("wpass","");
   mqttUser=settings.getString("user","");
@@ -424,35 +568,71 @@ void readConfig() {
   broker=settings.getString("broker",BROKER_DEFAULT);
   euroPerKwh=settings.getFloat("price",0.25f);
   settings.end();
-  if(broker.isEmpty()) broker=BROKER_DEFAULT;
+  if(broker.isEmpty())broker=BROKER_DEFAULT;
 }
 void requestAll() {
   if(!mqtt.connected())return;
-  for(int i=0;i<4;i++) if(!ids[i].isEmpty()) {
+  for(int i=0;i<4;i++)if(!ids[i].isEmpty()) {
     String topic="home/energy/"+ids[i]+"/request";
-    mqtt.publish(topic.c_str(),"update");
+    mqtt.publish(topic.c_str(),"update"); // Read-only request, NO actuator command.
   }
   lastPoll=millis();
 }
+void startStation() {
+  WiFi.mode(portalActive?WIFI_AP_STA:WIFI_STA);
+  if(!setTxLevel(0,"before STA begin")) {
+    Serial.println("[WiFi] TX cap failed, no STA connect");
+    nextWifiAttempt=millis()+10000;wifiFailures++;return;
+  }
+  WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
+  wifiReconnects++;
+  nextWifiAttempt=millis()+WIFI_RETRY_MS[wifiRetryIdx];
+  if(wifiRetryIdx<3)wifiRetryIdx++;
+}
 void maintainConnection() {
   if(WiFi.status()!=WL_CONNECTED) {
-    if(millis()-lastWifiTry>10000) {
-      lastWifiTry=millis(); WiFi.reconnect();
+    if(!disconnectedSince)disconnectedSince=millis();
+    if(dueAt(nextWifiAttempt) && wifiSsid.length()) {
+      Serial.println("[WiFi] reconnecting");startStation();
+    }
+    if(!portalActive && wifiSsid.length() && millis()-disconnectedSince>20000UL) {
+      beginPortal(true); // Recovery keeps STA reconnecting (AP+STA).
     }
     return;
   }
-  if(mqtt.connected()) {mqtt.loop();return;}
-  if(millis()-lastMqttTry<8000) return;
-  lastMqttTry=millis();
-  String id="display28-"+String((uint32_t)ESP.getEfuseMac(),HEX);
-  Serial.println("Connecting secure MQTT...");
+  if(!wifiEverConnected) {wifiEverConnected=true;Serial.println("[WiFi] connected");}
+  if(disconnectedSince) {
+    wifiRetryIdx=0;disconnectedSince=0;
+    Serial.printf("[WiFi] recovered IP=%s\n",localIp().c_str());
+  }
+  if(portalActive && !portalForced)stopRecoveryPortal();
+  retuneWifi();
+  if(mqtt.connected()) {
+    mqtt.loop();mqttRetryIdx=0;
+    return;
+  }
+  // TLS certificate verification must never run against an unknown clock.
+  if(time(nullptr)<1600000000)return;
+  if(!dueAt(nextMqttAttempt))return;
+  mqttReconnects++;
+  const String id=deviceId();
+  Serial.printf("[MQTT] TLS connect attempt %lu\n",(unsigned long)mqttReconnects);
   if(mqtt.connect(id.c_str(),mqttUser.c_str(),mqttPass.c_str())) {
     mqtt.subscribe("home/energy/+/state");
     mqtt.subscribe("home/energy/+/status");
     mqtt.subscribe("home/energy/+/health");
-    lastPoll=millis()-55000; render();
+    Serial.println("[MQTT] connected and subscribed");
+    mqttEverConnected=true;
+    mqttRetryIdx=0;
+    lastPoll=millis()-55000UL;render();
   } else {
-    Serial.printf("MQTT connect error: %d\n",mqtt.state());
+    mqttFailures++;
+    const uint32_t* steps=mqttEverConnected?MQTT_RUN_RETRY_MS:MQTT_BOOT_RETRY_MS;
+    uint8_t last=mqttEverConnected?2:4;
+    uint32_t delayMs=steps[mqttRetryIdx];
+    if(mqttRetryIdx<last)mqttRetryIdx++;
+    nextMqttAttempt=millis()+delayMs;
+    Serial.printf("[MQTT] state=%d retry in %lu ms\n",mqtt.state(),(unsigned long)delayMs);
   }
 }
 void handleTouch() {
@@ -473,45 +653,53 @@ void handleTouch() {
 }
 void setup() {
   Serial.begin(115200);
-  Serial.printf("Energy Monitor firmware %s\n", FW_VERSION);
+  Serial.printf("Energy Monitor %s / %s\n",FW_VERSION,COMPAT_PLATFORM);
   pinMode(21,OUTPUT); digitalWrite(21,HIGH);
   lcd->begin();lcd->invertDisplay(true);
   SPI.begin(25,39,32,33);
-  touch.begin(); touch.setRotation(1);
+  touch.begin();touch.setRotation(1);
   readConfig();
-  if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
-    beginSetup();return;
-  }
-  render();
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
-  uint32_t st=millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-st<20000)delay(200);
-  if(WiFi.status()!=WL_CONNECTED) {beginSetup();return;}
-  configTime(0,0,"pool.ntp.org","time.google.com");
-  st=millis();
-  while(time(nullptr)<1600000000 && millis()-st<12000) delay(200);
-  // CA validation requires a correct system clock, never use setInsecure().
   tls.setCACert(LE_ROOT_CA);
   mqtt.setServer(broker.c_str(),8883);
   mqtt.setBufferSize(12288);
   mqtt.setCallback(mqttMessage);
-  lastMqttTry=millis()-10000;
+  configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4","pool.ntp.org","time.google.com");
+  timeConfigured=true;
+  if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
+    beginPortal(false);return;
+  }
+  WiFi.mode(WIFI_STA);
+  registerWebRoutes(); // Local read-only /health; credential POST closed outside portal.
+  startStation();       // Nonblocking; AP+STA fallback after 20 seconds.
   render();
 }
 void loop() {
-  if(setupMode) {webServer.handleClient();delay(10);return;}
-  // Reset local credentials using USB Serial Monitor: CONFIG + Enter.
+  // Serial: PORTAL enters maintenance AP with screen-displayed one-time code;
+  // CONFIG erases just this display's saved credentials (as in ver0.01).
   if(Serial.available()) {
-    String cmd=Serial.readStringUntil('\n');cmd.trim();
+    String cmd=Serial.readStringUntil('\n');cmd.trim();cmd.toUpperCase();
     if(cmd=="CONFIG") {
       settings.begin("energy28",false);settings.clear();settings.end();
       ESP.restart();
+    } else if(cmd=="PORTAL") {
+      portalForced=true;beginPortal(wifiSsid.length()>0);
+    } else if(cmd=="STATUS") {
+      Serial.println(jsonStatus());
     }
+  }
+  if(routesReady)webServer.handleClient();
+  if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
+    if(!portalActive && dueAt(nextWifiAttempt)) {
+      nextWifiAttempt=millis()+10000;beginPortal(false);
+    }
+    delay(10);return;
   }
   maintainConnection();
   handleTouch();
-  if(mqtt.connected() && millis()-lastPoll>60000) requestAll();
-  if(millis()-lastDraw>10000) render();
+  if(mqtt.connected() && millis()-lastPoll>60000UL)requestAll();
+  if(millis()-lastDraw>10000UL && !portalActive)render();
+  if(millis()-lastHealthLine>60000UL) {
+    lastHealthLine=millis();Serial.println(jsonStatus());
+  }
   delay(8);
 }
