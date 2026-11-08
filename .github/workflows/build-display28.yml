@@ -33,7 +33,7 @@ jobs:
           board_build.flash_size = 4MB
           monitor_speed = 115200
           lib_deps =
-            moononournation/GFX Library for Arduino
+            moononournation/GFX Library for Arduino@1.4.9
             paulstoffregen/XPT2046_Touchscreen
           EOF
       - name: Compile
