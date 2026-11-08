@@ -1,0 +1,59 @@
+name: Build ESP32 Display2.8 firmware
+
+on:
+  push:
+    paths:
+      - 'Display2.8/Display2.8.ino'
+      - '.github/workflows/build-display28.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install Arduino core and libraries
+        run: |
+          arduino-cli config init
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.2.1 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install 'GFX Library for Arduino'
+          arduino-cli lib install 'XPT2046_Touchscreen'
+          python3 -m pip install --user esptool==4.8.1
+      - name: Compile for ESP32 Dev Module 4MB
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32:FlashSize=4M,FlashMode=dio,PartitionScheme=default --output-dir "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/Display2.8"
+      - name: Create bootable and app-only firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find build -maxdepth 1 -name '*.ino.bin' -print -quit)
+          BOOT=$(find build -maxdepth 1 -name '*.bootloader.bin' -print -quit)
+          PART=$(find build -maxdepth 1 -name '*.partitions.bin' -print -quit)
+          test -s "$APP" && test -s "$BOOT" && test -s "$PART"
+          cp "$APP" Display2.8/Display2.8-app-only.bin
+          BOOTAPP=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin -print -quit)
+          test -s "$BOOTAPP"
+          python3 -m esptool --chip esp32 merge_bin --flash_mode dio --flash_freq 40m --flash_size 4MB -o Display2.8/Display2.8.bin 0x1000 "$BOOT" 0x8000 "$PART" 0xe000 "$BOOTAPP" 0x10000 "$APP"
+          test -s Display2.8/Display2.8.bin
+          sha256sum Display2.8/*.bin
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-Display2.8-test-bins
+          path: |
+            Display2.8/Display2.8.bin
+            Display2.8/Display2.8-app-only.bin
+      - name: Publish BINs to repository
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Display2.8/Display2.8.bin Display2.8/Display2.8-app-only.bin
+          if ! git diff --cached --quiet; then
+            git commit -m 'Compile ESP32 Display2.8 firmware BINs'
+            git push
+          fi
