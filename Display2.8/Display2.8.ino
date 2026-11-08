@@ -80,8 +80,9 @@ void renderTab() {
       break;
     case 1:
       printAt(19, 106, "JSY-MK333", 2, CYAN2);
-      drawRow(141, "Phase R", "--");
-      drawRow(168, "Phase S", "--");
+      drawRow(133, "Phase R", "--");
+      drawRow(158, "Phase S", "--");
+      drawRow(183, "Phase T", "--");
       break;
     case 2:
       printAt(19, 106, "VENTILATION", 2, CYAN2);
