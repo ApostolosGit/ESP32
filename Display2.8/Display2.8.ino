@@ -1,5 +1,5 @@
 /*
- * ESP32-2432S028 / CYD2USB 2.8" - 4 touch tabs, OFFLINE TEST
+ * ESP32-2432S028 / CYD2USB 2.8" - direct 4 touch tabs, OFFLINE TEST
  * Repository: ApostolosGit/ESP32/Display2.8
  * Flash: ESP32 Dev Module, 4MB, DIO. No Wi-Fi or MQTT credentials.
  *
@@ -74,9 +74,9 @@ void renderTab() {
   lcd->fillRoundRect(9, 92, 302, 112, 8, PANEL);
   switch (selectedTab) {
     case 0:
-      printAt(19, 106, "HELLO!", 3, CYAN2);
-      printAt(19, 141, "DDS238", 2, WHITE2);
-      printAt(19, 170, "Power: -- W", 2, WHITE2);
+      printAt(19, 106, "DDS238", 2, CYAN2);
+      printAt(19, 141, "Power: -- W", 2, WHITE2);
+      printAt(19, 170, "Voltage: -- V", 2, WHITE2);
       break;
     case 1:
       printAt(19, 106, "JSY-MK333", 2, CYAN2);
@@ -116,7 +116,7 @@ void setup() {
   touch.begin(touchSPI);
   touch.setRotation(1);
 
-  Serial.println("CYD 2.8-inch tab test started");
+  Serial.println("CYD 2.8-inch 4-tab test started (no splash screen)");
   Serial.println("Touch tab positions: x=0..319, y=41..81");
   renderTab();
 }
