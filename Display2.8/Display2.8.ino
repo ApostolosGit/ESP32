@@ -73,6 +73,8 @@ uint32_t lastMqttPacketAt=0;
 char lastMqttTopic[100]={0},lastMqttError[55]={0},lastUnknownTopic[100]={0};
 bool mqttSubs[3]={false,false,false};
 uint32_t lastTouchRawX=0,lastTouchRawY=0;
+uint32_t nextProbeAt[4]={0,0,0,0};
+uint32_t nextSubRetryAt=0;
 void requestAll(); // Settings UI and MQTT callback can schedule polling
 
 
@@ -140,7 +142,7 @@ void retuneWifi() {
 }
 String localIp() {return WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():String("--");}
 String jsonStatus() {
-  StaticJsonDocument<1152> j;
+  DynamicJsonDocument j(2048);
   j["fw"]=FW_VERSION;
   j["platform_compat"]="1.06";j["chip"]="ESP32-D0WD";j["device_id"]=deviceId();
   j["uptime_sec"]=millis()/1000UL;j["heap_free"]=ESP.getFreeHeap();
@@ -244,6 +246,43 @@ uint8_t portalOctet() {
   if(WiFi.status()==WL_CONNECTED && WiFi.localIP()[3]>=2 &&
      WiFi.localIP()[3]<=254)return WiFi.localIP()[3];
   return 88; // No pre-reserved static IP for this board.
+}
+// Detailed non-secret diagnostic data for the settings web endpoints.
+String mqttDebugJson() {
+  DynamicJsonDocument j(4096);
+  j["firmware"]=FW_VERSION;
+  j["mqtt_connected"]=mqtt.connected();
+  j["broker"]=broker;
+  j["broker_port"]=8883;
+  j["client_id"]=deviceId();
+  j["state"]=mqtt.state();
+  j["packets_received"]=mqttPackets;
+  j["json_failures"]=mqttJsonErrors;
+  j["unrecognized_topics"]=mqttUnknown;
+  j["requests_sent"]=mqttRequestTotal;
+  j["last_topic"]=lastMqttTopic;
+  j["last_unknown_topic"]=lastUnknownTopic;
+  j["last_error"]=lastMqttError;
+  j["state_subscribed"]=mqttSubs[0];
+  j["status_subscribed"]=mqttSubs[1];
+  j["health_subscribed"]=mqttSubs[2];
+  j["last_message_age_seconds"]=lastMqttPacketAt?(int)((millis()-lastMqttPacketAt)/1000UL):-1;
+  JsonArray list=j.createNestedArray("devices");
+  const char *names[4]={"DDS Artemida","JSY Nestou 5A","Ventilation","Boiler"};
+  for(int i=0;i<4;i++) {
+    JsonObject o=list.createNestedObject();
+    const SourceDebug &d=sourceDebug[i];
+    o["label"]=names[i];o["device_id"]=ids[i];
+    o["status_known"]=d.statusKnown;o["status_online"]=d.statusOnline;
+    o["status_messages"]=d.statusCount;o["health_messages"]=d.healthCount;
+    o["state_messages"]=d.stateCount;o["request_messages"]=d.requests;
+    o["request_failures"]=d.requestFails;
+    o["last_status_age_sec"]=d.statusAt?(int)((millis()-d.statusAt)/1000UL):-1;
+    o["last_health_age_sec"]=d.healthAt?(int)((millis()-d.healthAt)/1000UL):-1;
+    o["last_state_age_sec"]=d.stateAt?(int)((millis()-d.stateAt)/1000UL):-1;
+    o["state_usable_now"]=live(i);
+  }
+  String out;serializeJson(j,out);return out;
 }
 // ---------- Greek uppercase in the built-in 5x7 pixel typeface ----------
 // Map visually identical Greek capitals to Latin, draw remaining glyphs.
@@ -848,32 +887,85 @@ int typeByDoc(JsonDocument &doc) {
   if(doc.containsKey("power")) return 0;
   return -1;
 }
+// Decode every subscribed topic. Every device has its own counters and ages,
+// making it possible to distinguish missing traffic from stale/invalid JSON.
 void mqttMessage(char *topic,byte *payload,unsigned int len) {
+  mqttPackets++;lastMqttPacketAt=millis();
+  snprintf(lastMqttTopic,sizeof(lastMqttTopic),"%s",topic);
   String t=topic, prefix="home/energy/";
-  if(!t.startsWith(prefix)) return;
+  if(!t.startsWith(prefix)) {mqttUnknown++;return;}
   String rest=t.substring(prefix.length());
-  int div=rest.indexOf('/');if(div<1) return;
+  int div=rest.indexOf('/');
+  if(div<1) {mqttUnknown++;snprintf(lastUnknownTopic,sizeof(lastUnknownTopic),"%s",topic);return;}
   String id=rest.substring(0,div), suffix=rest.substring(div+1);
-  if(suffix=="state") {
+  int type=typeById(id);
+  if(suffix=="state" || suffix=="health") {
     incomingState.clear();
-    DeserializationError err=deserializeJson(incomingState,(const char *)payload,len);
-    if(err) {Serial.println(String("Invalid JSON: ")+err.c_str());return;}
-    int type=typeById(id);if(type<0) type=typeByDoc(incomingState);
-    if(type<0) return;
-    state[type].clear();
-    state[type].set(incomingState.as<JsonObjectConst>());
-    hasState[type]=true;
-    ids[type]=id;
-    lastRx[type]=millis();
-    if(currentPage==type && !portalActive) render();
+    DeserializationError err=deserializeJson(incomingState,(const char*)payload,len);
+    if(err) {
+      mqttJsonErrors++;
+      snprintf(lastMqttError,sizeof(lastMqttError),
+               "%.18s JSON %s",id.c_str(),err.c_str());
+      Serial.printf("[MQTT] BAD JSON %s (%u bytes): %s\n",
+                    topic,len,err.c_str());
+      return;
+    }
+    // Prefer the firmware's own meter/device_type field over heuristic ID matching.
+    int declared=typeByDoc(incomingState);
+    if(declared>=0)type=declared;
+    if(type<0) {
+      mqttUnknown++;
+      snprintf(lastUnknownTopic,sizeof(lastUnknownTopic),"%s",topic);
+      Serial.printf("[MQTT] Unknown type for %s\n",topic);
+      return;
+    }
+    ids[type]=id; // Discovered from the actual MQTT topic.
+    SourceDebug &d=sourceDebug[type];
+    if(suffix=="health") {
+      d.healthCount++;d.healthAt=millis();
+      if(!hasState[type] || !live(type))nextProbeAt[type]=millis()+500UL;
+      Serial.printf("[MQTT] HEALTH type=%d id=%s bytes=%u\n",type,id.c_str(),len);
+    } else {
+      state[type].clear();
+      state[type].set(incomingState.as<JsonObjectConst>());
+      if(state[type].overflowed()) {
+        mqttJsonErrors++;
+        snprintf(lastMqttError,sizeof(lastMqttError),"%s: state overflow",id.c_str());
+        Serial.printf("[MQTT] state overflow: %s\n",id.c_str());
+        return;
+      }
+      hasState[type]=true;lastRx[type]=millis();
+      d.stateCount++;d.stateAt=millis();
+      nextProbeAt[type]=0;
+      Serial.printf("[MQTT] STATE type=%d id=%s bytes=%u\n",type,id.c_str(),len);
+    }
   } else if(suffix=="status") {
-    int type=typeById(id);
-    if(type>=0 && (ids[type].isEmpty() || ids[type]==id)) ids[type]=id;
-  } else if(suffix=="health") {
-    // Health frames advertise identity but are not live measurement samples.
-    int type=typeById(id);
-    if(type>=0 && ids[type].isEmpty()) ids[type]=id;
+    if(type<0) {
+      mqttUnknown++;
+      snprintf(lastUnknownTopic,sizeof(lastUnknownTopic),"%s",topic);
+      Serial.printf("[MQTT] Unknown STATUS %s\n",topic);
+      return;
+    }
+    ids[type]=id;
+    SourceDebug &d=sourceDebug[type];
+    d.statusAt=millis();d.statusCount++;
+    String value;
+    for(unsigned i=0;i<len&&i<16;i++)value+=(char)payload[i];
+    value.trim();value.toLowerCase();
+    if(value=="online"||value=="offline") {
+      d.statusKnown=true;d.statusOnline=(value=="online");
+      if(d.statusOnline && (!hasState[type] || !live(type)))
+        nextProbeAt[type]=millis()+600UL;
+    }
+    Serial.printf("[MQTT] STATUS type=%d id=%s value=%s\n",
+                  type,id.c_str(),value.c_str());
+  } else {
+    mqttUnknown++;
+    snprintf(lastUnknownTopic,sizeof(lastUnknownTopic),"%s",topic);
+    return;
   }
+  if(settingsOpen && settingsPane==2)render();
+  else if(!settingsOpen && !portalActive && type==(int)currentPage)render();
 }
 void readConfig() {
   settings.begin("energy28",true); // Keep backwards compatibility with ver0.01 NVS.
@@ -886,13 +978,37 @@ void readConfig() {
   settings.end();
   if(broker.isEmpty())broker=BROKER_DEFAULT;
 }
+// Device firmware responds to "update" with a non-retained /state frame.
+// The /status and /health messages are retained, so request samples as soon
+// as their actual full MAC-suffixed MQTT topic IDs have been discovered.
+bool requestDevice(int i,bool manual=false) {
+  if(i<0||i>3||!mqtt.connected()||ids[i].isEmpty())return false;
+  SourceDebug &d=sourceDebug[i];
+  if(!manual && d.requestAt && millis()-d.requestAt<15000UL)return false;
+  const String topic="home/energy/"+ids[i]+"/request";
+  bool ok=mqtt.publish(topic.c_str(),"update");
+  d.requestAt=millis();d.requests++;mqttRequestTotal++;
+  if(!ok)d.requestFails++;
+  nextProbeAt[i]=0;
+  Serial.printf("[MQTT] REQUEST type=%d id=%s result=%s\n",i,ids[i].c_str(),ok?"sent":"FAILED");
+  return ok;
+}
 void requestAll() {
   if(!mqtt.connected())return;
-  for(int i=0;i<4;i++)if(!ids[i].isEmpty()) {
-    String topic="home/energy/"+ids[i]+"/request";
-    mqtt.publish(topic.c_str(),"update"); // Read-only request, NO actuator command.
-  }
+  for(int i=0;i<4;i++)requestDevice(i,true);
   lastPoll=millis();
+}
+void serviceDeviceProbes() {
+  if(!mqtt.connected())return;
+  for(int i=0;i<4;i++) {
+    if(ids[i].isEmpty())continue;
+    // For missing/stale samples request an update every 15s, never flood broker.
+    bool stale=!hasState[i] || (millis()-lastRx[i]>90000UL);
+    if(stale && (nextProbeAt[i]==0 || dueAt(nextProbeAt[i]))) {
+      if(!sourceDebug[i].requestAt || millis()-sourceDebug[i].requestAt>=15000UL)
+        requestDevice(i,false);
+    }
+  }
 }
 void startStation() {
   if(!WiFi.mode(portalActive?WIFI_AP_STA:WIFI_STA)) {
@@ -954,7 +1070,17 @@ void maintainConnection() {
     Serial.println("[NTP] retry");
   }
   if(mqtt.connected()) {
-    mqtt.loop();mqttRetryIdx=0;
+    if(!mqtt.loop()) {
+      Serial.println("[MQTT] broker transport interrupted");
+      return;
+    }
+    mqttRetryIdx=0;
+    if(dueAt(nextSubRetryAt)) {
+      if(!mqttSubs[0])mqttSubs[0]=mqtt.subscribe("home/energy/+/state");
+      if(!mqttSubs[1])mqttSubs[1]=mqtt.subscribe("home/energy/+/status");
+      if(!mqttSubs[2])mqttSubs[2]=mqtt.subscribe("home/energy/+/health");
+      nextSubRetryAt=millis()+30000UL;
+    }
     return;
   }
   // TLS certificate verification must never run against an unknown clock.
@@ -964,12 +1090,14 @@ void maintainConnection() {
   const String id=deviceId();
   Serial.printf("[MQTT] TLS connect attempt %lu\n",(unsigned long)mqttReconnects);
   if(mqtt.connect(id.c_str(),mqttUser.c_str(),mqttPass.c_str())) {
-    mqtt.subscribe("home/energy/+/state");
-    mqtt.subscribe("home/energy/+/status");
-    mqtt.subscribe("home/energy/+/health");
-    Serial.println("[MQTT] connected and subscribed");
+    mqttSubs[0]=mqtt.subscribe("home/energy/+/state");
+    mqttSubs[1]=mqtt.subscribe("home/energy/+/status");
+    mqttSubs[2]=mqtt.subscribe("home/energy/+/health");
+    Serial.printf("[MQTT] connected SUBS state=%d status=%d health=%d\n",
+                  mqttSubs[0],mqttSubs[1],mqttSubs[2]);
     mqttEverConnected=true;
-    mqttRetryIdx=0;
+    mqttRetryIdx=0;nextSubRetryAt=millis()+30000UL;
+    for(int i=0;i<4;i++)if(ids[i].length())nextProbeAt[i]=millis()+1500UL+i*300UL;
     lastPoll=millis()-55000UL;if(!portalActive)render();
   } else {
     mqttFailures++;
