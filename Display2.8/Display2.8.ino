@@ -66,7 +66,7 @@ String portalPassword, portalCode;
 const wifi_power_t TX_STEPS[] = {WIFI_POWER_8_5dBm, WIFI_POWER_11dBm,
                                 WIFI_POWER_13dBm, WIFI_POWER_15dBm};
 const uint8_t TX_TENTHS[] = {85,110,130,150};
-const uint32_t WIFI_RETRY_MS[] = {3000,7000,15000,30000};
+const uint32_t WIFI_RETRY_MS[] = {10000,15000,30000,60000};
 const uint32_t MQTT_BOOT_RETRY_MS[] = {10000,30000,60000,120000,300000};
 const uint32_t MQTT_RUN_RETRY_MS[] = {5000,10000,30000};
 bool dueAt(uint32_t target) {return (int32_t)(millis()-target)>=0;}
@@ -304,7 +304,7 @@ void jsyPage() {
     String f="p"+String(i+1);
     double power=live(1)?numberOf(1,f.c_str()):NAN;
     String dir="dir"+String(i+1);
-    if(isfinite(power) && power>0 && String(state[1][dir] | "")=="REV") power=-power;
+    if(isfinite(power) && power>0 && (String(state[1][dir] | "")=="REV" || (String(state[1][dir] | "").isEmpty() && numberOf(1,("i"+String(i+1)).c_str())<0))) power=-power;
     txt(x+5,118,fmt(power,0),powerColor(power),2);
   }
   for(int z=1;z<=2;z++) {
@@ -469,7 +469,7 @@ void registerWebRoutes() {
     HTTPUpload& u=webServer.upload();
     if(u.status==UPLOAD_FILE_START) {
       otaImageComplete=false;
-      if(!u.filename.endsWith(".bin") || !Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))
+      if(u.filename!="Display2.8-app-only.bin" || !Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))
         Serial.println("[OTA] begin failed or bad filename");
     } else if(u.status==UPLOAD_FILE_WRITE) {
       if(Update.isRunning() && Update.write(u.buf,u.currentSize)!=u.currentSize)
