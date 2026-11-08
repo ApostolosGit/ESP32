@@ -1,60 +1,51 @@
-# ESP32 Display2.8 — Energy Monitor (MQTT) · ver0.01
+# ESP32 Display2.8 — Energy Monitor ver0.02
 
-**Τρέχουσα έκδοση: `ver0.01` (08/11/2026).** Η έκδοση εμφανίζεται στην οθόνη και στο Serial Monitor (115200 baud).
+**Hardware:** ESP32-2432S028 dual-USB, classic ESP32-D0WD-V3, 4 MB flash, ST7789 TFT, XPT2046 touch, 320×240 landscape.
 
-## Ιστορικό εκδόσεων
+**Source:** `Display2.8.ino`, supported public TLS certificate: `TrustedCA.h`.
+**Compilation:** GitHub Actions/PlatformIO, succeeds for `esp32dev`; **physical runtime validation is still required**.
 
-- **ver0.01** — Πρώτη έκδοση του Energy Monitor με καρτέλες Αρτέμιδα, Νέστου 5Α, VENT και BOILER, ανάγνωση MQTT και αρχική ρύθμιση Wi-Fi/HiveMQ. Επιτυχής μεταγλώττιση· απαιτείται επιβεβαίωση πάνω στη φυσική συσκευή.
+## Version history
 
-Σε κάθε επόμενη αλλαγή η έκδοση στο `#define FW_VERSION` θα αυξάνεται σε `ver0.02`, `ver0.03` κ.ο.κ. Η αυτοματοποιημένη μεταγλώττιση δημιουργεί το τρέχον `Display2.8.bin` και ξεχωριστό αρχείο `Display2.8-ver0.01.bin` (για αυτή την έκδοση), ώστε να μην χάνεται το παλαιότερο BIN.
+- **ver0.02 — 08/11/2026:** CommonPlatform v1.06-compatible **classic-ESP32 adapter**: adaptive Wi-Fi TX ceiling (8.5, 11, 13, 15 dBm), nonblocking station reconnect, AP+STA recovery while retrying the router, MQTT boot/runtime backoff, local diagnostics (IP, Wi-Fi RSSI, TX ceiling, heap, NTP, reconnect attempts, stale sample ages), separate provisioning code, and locally authenticated OTA with an **app-only** binary. Retains all four touchscreen tabs and the original MQTT read-only behavior.
+- **ver0.01 — 08/11/2026:** Initial live MQTT dashboard and Wi-Fi setup for the four tabs.
 
+**Important compatibility boundary:** CommonPlatform v1.06 is designed for ESP32-C3 Super Mini; this display has a classic ESP32, so the code cannot be included verbatim. This version follows relevant networking and recovery principles, **not full source-level or feature-level parity**. It does not implement CommonPlatform's C3-specific RTC crash tracing, its remote MQTT/admin OTA protocol v2, all LittleFS credential migrations, or automatic OTA rollback. Its credentials remain in classic ESP32 Preferences/NVS.
 
-Working **compile-tested**, not yet verified on physical hardware. For the **ESP32-2432S028 dual-USB**, ST7789, XPT2046, 4 MB flash, 320×240 landscape.
+## Four tabs
 
-**The Arduino sketch and full-flash BIN are automatically built and committed in this folder.**
+- **ΑΡΤΕΜΙΔΑ:** `power` (W), `z_diff` (kWh and estimated €), `z_now`, `z_ref`, `utility_date`.
+- **ΝΕΣΤΟΥ 5Α:** three phases `p1`, `p2`, `p3`, total `power_total`; two billing zones (`z1_*` / `z2_*`).
+- **VENT:** outside, inside and intermediate DS18B20; two DHT11 groups (temperature, relative and absolute humidity, feels-like); fan and AUTO/MANUAL, speed and season.
+- **BOILER:** `temp_1` to `temp_4` on GPIO 5/6/7/21; **read-only**.
 
-## Four touchscreen tabs
+Black background, yellow for negative power, red for positive power/energy difference, white readings, cyan titles. Numbers use Greek decimal commas; `--` means unavailable/stale.
 
-- **ΑΡΤΕΜΙΔΑ** — «ΜΕΤΡΗΤΗΣ ΔΕΗ ΑΡΤΕΜΙΔΑ»: live `power` (W), `z_diff` (kWh plus estimated cost), `z_now`, `z_ref`, date `utility_date`.
-- **ΝΕΣΤΟΥ 5Α** — three phase powers `p1`/`p2`/`p3` and `power_total`, zones Z1 (ΑΚΡΙΒΟ) and Z2 (ΟΙΚΟΝΟΜΙΚΟ), `z1_diff`, `z2_diff`, `z1_now`, `z2_now`, `z1_ref`, `z2_ref`.
-- **VENT** — three DS18B20 values, outside and inside DHT11 readings (temperature/humidity/absolute humidity/feels-like), mode/fan/speed/season.
-- **BOILER** — four DS18B20 readings `temp_1` through `temp_4` (GPIO 5/6/7/21). **Read-only**, no boiler control.
+## Flash and OTA — make a backup first
 
-The style uses a black background, yellow for negative power, red for positive power/energy difference, white readings and cyan headers. Numbers use Greek decimal comma and thousands dot. All data are from the MQTT JSON; `--` means unavailable or stale, not an artificial measurement.
+The device's **original factory 4 MiB flash backup** must be saved separately before flashing.
 
-## First boot / private credentials
+- `Display2.8.bin` and `Display2.8-ver0.02.bin`: **merged bootloader + partition table + app**. Web flasher starting at **`0x000000`**. A merged image may overwrite NVS settings; provision credentials again if lost.
+- `Display2.8-app-only.bin`: **app image only**. For upgrading this specific display **from ver0.01 built with the same default PlatformIO partition table**, flash at **`0x10000`** to keep the existing bootloader and partition table. This is typically less disruptive to NVS, but always keep your backup. **Do not use this offset if the existing partition layout is different.**
+- After initial provisioning, in recovery/maintenance portal, go to `http://192.168.4.1/ota`. For OTA use **only** `Display2.8-app-only.bin`, not a merged `Display2.8.bin`. OTA requires the one-time displayed code as the HTTP Basic password with user `admin`. OTA needs an OTA-capable partition layout and does not provide CommonPlatform v2's complete recovery/rollback protocol.
 
-**No passwords or Wi-Fi credentials are stored in this public repository.**
+## Credential setup and AP+STA recovery
 
-1. Before flashing, save the original **4 MiB factory flash backup**.
-2. Flash the **complete merged** `Display2.8.bin` to address **`0x000000`** with a compatible Web ESP flasher. **Do not** use the app-only BIN at that address.
-3. On first boot, the screen shows **SETUP WIFI + MQTT**.
-4. From a phone or PC, connect to the temporary Wi-Fi access point `ESP28-SETUP-XXXX` shown on the screen. AP password: **`Display28!`**.
-5. Open **`http://192.168.4.1`** and enter your home's Wi-Fi SSID/password and the **HiveMQ MQTT username/password**; the broker host is prefilled from the companion MQTT.app. Set the electricity price in €/kWh (default **0.25**). Save; ESP32 restarts into the tabs.
-6. The device connects to HiveMQ Cloud using **TLS 8883 with trusted ISRG Root X1**, subscribes to `home/energy/+/state`, `+/status`, `+/health` and sends only read/update requests `home/energy/<device-id>/request` → `update` about once per minute, **never sends a control or OTA command**.
+Wi-Fi SSID/password and HiveMQ username/password **must never be committed to this public repository**. Saved local `Preferences` namespace remains `energy28`, compatible with ver0.01.
 
-If the configured Wi-Fi is unreachable at boot, setup mode starts again. To clear saved on-device credentials deliberately, open a USB Serial Monitor at **115200 baud**, enter `CONFIG` and press Return (then reboot). MQTT requires that network time/NTP is available for TLS validation.
+1. If the device has no saved credentials, it creates a temporary `ESP28-SETUP-XXXX` AP and shows the **random AP password and setup code on the screen**. The old fixed `Display28!` AP password from ver0.01 is **no longer used**.
+2. Connect to that AP, open `http://192.168.4.1`, enter the code visible on the screen and configure Wi-Fi/HiveMQ.
+3. If the router is disconnected for more than 20 s, **AP+STA recovery** becomes available while the ESP retries the configured router Wi-Fi; the device will close its recovery AP automatically after a successful reconnection (unless manually forced).
+4. From USB Serial Monitor at 115200 baud, type `STATUS` for local JSON diagnostics, `PORTAL` to open a temporary maintenance AP (credentials remain stored), or `CONFIG` to clear only this device's saved settings and restart. The maintenance AP remains available until reboot.
+5. When connected to the LAN, open `http://<device-IP>/health` to see non-secret diagnostics, including `fw: "ver0.02"`, IP/RSSI, heap and state ages. Configuration and OTA endpoints are closed outside portal mode.
+6. MQTT uses trusted CA and TLS port **8883**, and needs NTP time synchronization. It subscribes to `home/energy/+/state`, `+/status`, `+/health` and sends only periodic `request/update` read requests; **no device actuation**.
 
-The Wi-Fi AP uses WPA2 and shuts down after setup. Credentials are saved in ESP32 Preferences (not in GitHub); as with normal ESP32 NVS, physical flash access can potentially recover them unless flash encryption is enabled.
+**TX limits:** Requested limit is chosen from 8.5 / 11 / 13 / 15 dBm based on connected RSSI and never above 15 dBm. Initial radio use requests 8.5 dBm. The actual radiated power has not been measured. If firmware cannot install the initial limit, it does not initiate STA connection.
 
-## File roles
+## Libraries and wiring
 
-| File | Description |
-| --- | --- |
-| `Display2.8.ino` | Arduino sketch with display, touch, provisioning and MQTT |
-| `TrustedCA.h` | Public ISRG Root X1 CA (not a secret) |
-| `Display2.8-ver0.01.bin` | Στιγμιότυπο πλήρους firmware της έκδοσης ver0.01, στην ίδια διεύθυνση `0x000000` |
-| `Display2.8.bin` | Full merged image: bootloader + partitions + application, flash at `0x000000` |
-| `Display2.8-app-only.bin` | Application only, offset `0x10000` **only if existing partition table is compatible** |
-| `.github/workflows/build-display28.yml` | Automatic compile and commit of binaries |
+- LCD: SCK 14, MOSI 13, MISO 12, CS 15, DC 2, backlight 21.
+- Touch XPT2046: SCK 25, MOSI 32, MISO 39, CS 33, IRQ 36.
+- Library versions used by CI: `GFX Library for Arduino@1.4.9`, `XPT2046_Touchscreen`, `PubSubClient@2.8`, `ArduinoJson@6.21.5`, PlatformIO `espressif32@6.10.0`.
 
-## Hardware wiring (on-board)
-
-- TFT: CLK 14, MOSI 13, MISO 12, CS 15, DC 2, backlight 21.
-- Touch: CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36.
-- ST7789 and rotation calibrated against first tested tab firmware, but the live MQTT build still needs a real hardware test.
-- Code uses GFX Library for Arduino 1.4.9, XPT2046_Touchscreen, ArduinoJson 6.21.5 and PubSubClient 2.8.
-
-### Important
-
-Compilation success does **not** prove the screen, touch, Wi-Fi, NTP, or MQTT credentials work on your physical device. Report a photo of the first-boot setup and a later tab, or Serial Monitor output, to adjust safely.
+Binary build files are published beside the sketch by `.github/workflows/build-display28.yml` and old versioned `Display2.8-ver*.bin` files remain available.
