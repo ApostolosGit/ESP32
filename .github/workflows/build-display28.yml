@@ -24,6 +24,7 @@ jobs:
         run: |
           mkdir -p .display28-build/src
           cp Display2.8/Display2.8.ino .display28-build/src/main.cpp
+          cp Display2.8/*.h .display28-build/src/
           cat > .display28-build/platformio.ini <<'EOF'
           [env:esp32dev]
           platform = espressif32@6.10.0
@@ -35,6 +36,8 @@ jobs:
           lib_deps =
             moononournation/GFX Library for Arduino@1.4.9
             paulstoffregen/XPT2046_Touchscreen
+            knolleary/PubSubClient@2.8
+            bblanchon/ArduinoJson@6.21.5
           EOF
       - name: Compile
         run: |
