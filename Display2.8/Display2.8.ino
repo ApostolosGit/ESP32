@@ -68,9 +68,10 @@ uint32_t apWebSessionStartedMs=0, apPinLockedUntil=0;
 uint8_t apPinFailures=0;
 uint32_t portalStartMs=0, portalHealthMs=0, portalRetryAt=0, portalAttempts=0, portalFailures=0;
 bool wifiEverConnected=false, mqttEverConnected=false, otaImageComplete=false;
+bool wifiCurrentlyConnected=false;
 uint32_t wifiFailures=0, mqttFailures=0, wifiReconnects=0, mqttReconnects=0;
 uint32_t disconnectedSince=0, nextWifiAttempt=0, nextMqttAttempt=0;
-uint32_t lastTxTune=0, lastHealthLine=0;
+uint32_t lastTxTune=0, lastHealthLine=0, lastNtpAttempt=0;
 uint8_t wifiRetryIdx=0, mqttRetryIdx=0, txLevel=0;
 
 const wifi_power_t TX_STEPS[] = {WIFI_POWER_8_5dBm, WIFI_POWER_11dBm,
@@ -478,8 +479,8 @@ void drawSetup() {
   txt(14,184,"http://"+WiFi.softAPIP().toString(),UI_CYAN,2);
   txt(14,217,"No credentials on GitHub",UI_MUTED,1);
 }
-// A local portal requires physical access to the screen for its temporary code.
-// Every POST for configuration, including on the STA interface, requires this code.
+// CommonPlatform 1.06 open-AP PIN with a 15-minute scoped cookie session.
+// While the portal is active, all HTTP pages and actions require authentication.
 void registerWebRoutes() {
   if(routesReady)return;
   routesReady=true;
@@ -677,7 +678,7 @@ void mqttMessage(char *topic,byte *payload,unsigned int len) {
     hasState[type]=true;
     ids[type]=id;
     lastRx[type]=millis();
-    if(currentPage==type) render();
+    if(currentPage==type && !portalActive) render();
   } else if(suffix=="status") {
     int type=typeById(id);
     if(type>=0 && (ids[type].isEmpty() || ids[type]==id)) ids[type]=id;
@@ -708,33 +709,58 @@ void requestAll() {
 }
 void startStation() {
   WiFi.mode(portalActive?WIFI_AP_STA:WIFI_STA);
-  if(!setTxLevel(0,"before STA begin")) {
+  // CommonPlatform escalation: start low, raise the max only after failed attempts.
+  // Unlike the C3 implementation this board uses retry-based levels, not pre-scans.
+  uint8_t target=wifiRetryIdx>3?3:wifiRetryIdx;
+  if(!setTxLevel(target,"before STA begin")) {
     Serial.println("[WiFi] TX cap failed, no STA connect");
     nextWifiAttempt=millis()+10000;wifiFailures++;return;
   }
   WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
   wifiReconnects++;
+  wifiFailures++; // counts timed-out/repeated attempts, not necessarily auth failures.
   nextWifiAttempt=millis()+WIFI_RETRY_MS[wifiRetryIdx];
   if(wifiRetryIdx<3)wifiRetryIdx++;
 }
 void maintainConnection() {
   if(WiFi.status()!=WL_CONNECTED) {
+    if(wifiCurrentlyConnected) {
+      wifiCurrentlyConnected=false;
+      mqtt.disconnect();tls.stop();
+      nextMqttAttempt=millis();
+      Serial.println("[WiFi] lost connection, MQTT transport stopped");
+    }
     if(!disconnectedSince)disconnectedSince=millis();
     if(dueAt(nextWifiAttempt) && wifiSsid.length()) {
       Serial.println("[WiFi] reconnecting");startStation();
     }
-    if(!portalActive && wifiSsid.length() && millis()-disconnectedSince>20000UL) {
+    if(!portalActive && (!portalRetryAt || dueAt(portalRetryAt)) &&
+       wifiSsid.length() && millis()-disconnectedSince>20000UL) {
       beginPortal(true); // Recovery keeps STA reconnecting (AP+STA).
     }
     return;
   }
-  if(!wifiEverConnected) {wifiEverConnected=true;Serial.println("[WiFi] connected");}
+  if(!wifiCurrentlyConnected) {
+    wifiCurrentlyConnected=true;wifiEverConnected=true;
+    wifiRetryIdx=0;nextMqttAttempt=millis();
+    Serial.printf("[WiFi] connected IP=%s\n",localIp().c_str());
+    // CommonPlatform initializes NTP after a real router association.
+    configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4",
+                 "pool.ntp.org","time.google.com");
+    timeConfigured=true;lastNtpAttempt=millis();
+  }
   if(disconnectedSince) {
-    wifiRetryIdx=0;disconnectedSince=0;
+    disconnectedSince=0;
     Serial.printf("[WiFi] recovered IP=%s\n",localIp().c_str());
   }
   if(portalActive && !portalForced)stopRecoveryPortal();
   retuneWifi();
+  if(time(nullptr)<1600000000 && millis()-lastNtpAttempt>30000UL) {
+    configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4",
+                 "pool.ntp.org","time.google.com");
+    lastNtpAttempt=millis();
+    Serial.println("[NTP] retry");
+  }
   if(mqtt.connected()) {
     mqtt.loop();mqttRetryIdx=0;
     return;
@@ -752,7 +778,7 @@ void maintainConnection() {
     Serial.println("[MQTT] connected and subscribed");
     mqttEverConnected=true;
     mqttRetryIdx=0;
-    lastPoll=millis()-55000UL;render();
+    lastPoll=millis()-55000UL;if(!portalActive)render();
   } else {
     mqttFailures++;
     const uint32_t* steps=mqttEverConnected?MQTT_RUN_RETRY_MS:MQTT_BOOT_RETRY_MS;
@@ -774,6 +800,7 @@ void handleTouch() {
   int x=constrain((int)map(p.x,250,3800,0,319),0,319);
   int y=constrain((int)map(p.y,250,3800,0,239),0,239);
   Serial.printf("Touch %d,%d -> %d,%d\n",p.x,p.y,x,y);
+  if(portalActive)return; // Do not obscure the AP instructions during setup.
   if(y>=29 && y<=64) {
     int newPage=constrain(x/80,0,3);
     if(currentPage!=newPage) {currentPage=newPage;render();}
@@ -791,8 +818,6 @@ void setup() {
   mqtt.setServer(broker.c_str(),8883);
   mqtt.setBufferSize(12288);
   mqtt.setCallback(mqttMessage);
-  configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4","pool.ntp.org","time.google.com");
-  timeConfigured=true;
   if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
     beginPortal(false);return;
   }
