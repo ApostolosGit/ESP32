@@ -1,9 +1,10 @@
 /*
-  Energy Monitor ver0.01 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.03 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
-  AP setup (first boot): SSID ESP28-SETUP-XXXX, password Display28!, http://192.168.4.1
+  AP setup: OPEN SSID ESP28-SETUP-XXXX, web PIN 12134, 15 min session.
+  AP URL is shown on-screen (default http://192.168.2.88).
   Sensitive Wi-Fi/MQTT settings stay in on-device Preferences, never in source.
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
