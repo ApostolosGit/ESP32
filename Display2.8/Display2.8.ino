@@ -8,7 +8,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.02"
+#define FW_VERSION "ver0.03"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -18,6 +18,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -35,6 +36,7 @@ XPT2046_Touchscreen touch(33, 36);
 WiFiClientSecure tls;
 PubSubClient mqtt(tls);
 WebServer webServer(80);
+DNSServer portalDns;
 Preferences settings;
 
 const uint16_t UI_BG = 0x0000, UI_PANEL = 0x0820, UI_BORDER = 0x21A5;
@@ -57,12 +59,20 @@ StaticJsonDocument<6144> incomingState; // Global: avoid 6 KB stack allocation i
 // CommonPlatform 1.06-compatible network lifecycle for classic ESP32.
 // Deliberately NOT the C3-only platform source (target-specific adapters differ).
 bool portalActive=false, portalForced=false, routesReady=false, timeConfigured=false;
+bool apDnsRunning=false, pendingPortalStop=false;
+const char AP_WEB_PIN[] = "12134"; // CommonPlatform 1.06
+const uint32_t AP_WEB_SESSION_MS = 15UL*60UL*1000UL;
+const uint32_t AP_PIN_COOLDOWN_MS = 30000UL;
+char apWebSessionToken[33] = {};
+uint32_t apWebSessionStartedMs=0, apPinLockedUntil=0;
+uint8_t apPinFailures=0;
+uint32_t portalStartMs=0, portalHealthMs=0, portalRetryAt=0, portalAttempts=0, portalFailures=0;
 bool wifiEverConnected=false, mqttEverConnected=false, otaImageComplete=false;
 uint32_t wifiFailures=0, mqttFailures=0, wifiReconnects=0, mqttReconnects=0;
 uint32_t disconnectedSince=0, nextWifiAttempt=0, nextMqttAttempt=0;
 uint32_t lastTxTune=0, lastHealthLine=0;
 uint8_t wifiRetryIdx=0, mqttRetryIdx=0, txLevel=0;
-String portalPassword, portalCode;
+
 const wifi_power_t TX_STEPS[] = {WIFI_POWER_8_5dBm, WIFI_POWER_11dBm,
                                 WIFI_POWER_13dBm, WIFI_POWER_15dBm};
 const uint8_t TX_TENTHS[] = {85,110,130,150};
@@ -99,6 +109,11 @@ String jsonStatus() {
   j["rssi"]=WiFi.status()==WL_CONNECTED?WiFi.RSSI():-127;
   j["tx_max_tenths_dbm"]=TX_TENTHS[txLevel];
   j["ap_active"]=portalActive;j["mqtt_connected"]=mqtt.connected();
+  j["ap_ip"]=portalActive?WiFi.softAPIP().toString():"";
+  j["ap_pin_session_sec_left"]=portalActive && apWebSessionToken[0] &&
+    millis()-apWebSessionStartedMs < AP_WEB_SESSION_MS ?
+    (AP_WEB_SESSION_MS-(millis()-apWebSessionStartedMs))/1000UL : 0;
+  j["portal_attempts"]=portalAttempts;j["portal_failures"]=portalFailures;
   j["ntp_ready"]=(time(nullptr)>1600000000);
   j["wifi_reconnect_attempts"]=wifiReconnects;
   j["mqtt_reconnect_attempts"]=mqttReconnects;
@@ -108,12 +123,78 @@ String jsonStatus() {
   for(int i=0;i<4;i++)ages.add(hasState[i]?(millis()-lastRx[i])/1000UL:-1);
   String out;serializeJson(j,out);return out;
 }
-String makeOneTimeSecret(int chars) {
-  static const char alphabet[]="ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-  String out;for(int i=0;i<chars;i++)out+=alphabet[esp_random()%(sizeof(alphabet)-1)];
-  return out;
+// Same PIN + 15-minute cookie session design as CommonPlatform 1.06.
+// The fixed PIN is intentionally shared with that platform. Open Wi-Fi
+// does not encrypt HTTP, so limit usage to trusted physical surroundings.
+void resetApWebSession() {
+  apWebSessionToken[0]='\0';
+  apWebSessionStartedMs=0;
 }
-
+bool apWebSessionValid() {
+  if(!portalActive || !apWebSessionToken[0])return false;
+  if(millis()-apWebSessionStartedMs>=AP_WEB_SESSION_MS) {
+    resetApWebSession();return false;
+  }
+  const String cookies=webServer.header("Cookie");
+  const String expected="EMSESSION="+String(apWebSessionToken);
+  int start=0;
+  while(start<(int)cookies.length()) {
+    int pos=cookies.indexOf(';',start);
+    if(pos<0)pos=cookies.length();
+    String part=cookies.substring(start,pos);part.trim();
+    if(part==expected)return true;
+    start=pos+1;
+  }
+  return false;
+}
+void sendPinPage(int status=200) {
+  webServer.sendHeader("Cache-Control","no-store");
+  webServer.send(status,"text/html; charset=utf-8",
+    "<!doctype html><html><head><meta name='viewport' "
+    "content='width=device-width,initial-scale=1'></head>"
+    "<body style='background:#081522;color:#fff;font:20px Arial;padding:16px'>"
+    "<h3>Energy Monitor PIN</h3><p>Enter the 5-digit setup PIN.</p>"
+    "<form method='post' action='/ap-login'>"
+    "<input name='pin' type='password' inputmode='numeric' "
+    "pattern='[0-9]{5}' minlength='5' maxlength='5' required autofocus>"
+    "<button type='submit'>Open</button></form></body></html>");
+}
+bool requireApWebPin() {
+  if(!portalActive)return false;
+  if(apWebSessionValid())return true;
+  sendPinPage(webServer.method()==HTTP_GET?200:403);
+  return false;
+}
+void handleApWebLogin() {
+  if(!portalActive){webServer.send(404,"text/plain","Not found");return;}
+  if(apPinLockedUntil && !dueAt(apPinLockedUntil)) {
+    webServer.send(429,"text/plain","PIN temporarily locked. Try later.");
+    return;
+  }
+  if(webServer.arg("pin")!=AP_WEB_PIN) {
+    if(++apPinFailures>=5) {
+      apPinFailures=0;apPinLockedUntil=millis()+AP_PIN_COOLDOWN_MS;
+    }
+    sendPinPage(403);return;
+  }
+  apPinFailures=0;apPinLockedUntil=0;
+  snprintf(apWebSessionToken,sizeof(apWebSessionToken),
+    "%08lX%08lX%08lX%08lX",
+    (unsigned long)esp_random(),(unsigned long)esp_random(),
+    (unsigned long)esp_random(),(unsigned long)esp_random());
+  apWebSessionStartedMs=millis();
+  String cookie=String("EMSESSION=")+apWebSessionToken+
+    "; Path=/; HttpOnly; SameSite=Strict; Max-Age=900";
+  webServer.sendHeader("Cache-Control","no-store");
+  webServer.sendHeader("Set-Cookie",cookie);
+  webServer.sendHeader("Location","/",true);
+  webServer.send(303,"text/plain","");
+}
+uint8_t portalOctet() {
+  if(WiFi.status()==WL_CONNECTED && WiFi.localIP()[3]>=2 &&
+     WiFi.localIP()[3]<=254)return WiFi.localIP()[3];
+  return 88; // No pre-reserved static IP for this board.
+}
 // ---------- Greek uppercase in the built-in 5x7 pixel typeface ----------
 // Map visually identical Greek capitals to Latin, draw remaining glyphs.
 uint32_t nextUtf8(const char *&s) {
@@ -389,13 +470,12 @@ void drawSetup() {
   lcd->fillScreen(UI_BG);
   txt(12,15,"ENERGY MONITOR",UI_CYAN,2);
   txt(264,19,FW_VERSION,UI_CYAN,1);
-  txt(14,53,"SETUP WIFI + MQTT",UI_YELLOW,2);
+  txt(14,53,setupMode?"SETUP WIFI + MQTT":"AP+STA RECOVERY",UI_YELLOW,2);
   txt(14,88,"Connect to WiFi AP:",UI_WHITE,1);
   txt(14,105,apSsid,UI_CYAN,2);
-  txt(14,136,"AP PASS: "+portalPassword,UI_WHITE,1);
-  txt(14,153,"SETUP CODE: "+portalCode,UI_YELLOW,1);
-  txt(14,173,"Open browser:",UI_WHITE,1);
-  txt(14,188,"http://192.168.4.1",UI_CYAN,2);
+  txt(14,135,"WiFi OPEN  PIN: 12134",UI_YELLOW,1);
+  txt(14,166,"Open browser:",UI_WHITE,1);
+  txt(14,184,"http://"+WiFi.softAPIP().toString(),UI_CYAN,2);
   txt(14,217,"No credentials on GitHub",UI_MUTED,1);
 }
 // A local portal requires physical access to the screen for its temporary code.
@@ -403,44 +483,53 @@ void drawSetup() {
 void registerWebRoutes() {
   if(routesReady)return;
   routesReady=true;
+  const char *headers[]={"Cookie"};
+  webServer.collectHeaders(headers,1);
+  webServer.on("/ap-login",HTTP_POST,handleApWebLogin);
   webServer.on("/health",HTTP_GET,[](){
+    // CommonPlatform: every AP page/action is PIN-protected while the AP is active.
+    if(portalActive && !requireApWebPin())return;
+    webServer.sendHeader("Cache-Control","no-store");
     webServer.send(200,"application/json; charset=utf-8",jsonStatus());
   });
   webServer.on("/",HTTP_GET,[](){
     if(!portalActive) {
       webServer.send(200,"text/html; charset=utf-8",
-        "<h3>Energy Monitor "+String(FW_VERSION)+"</h3><p>Read-only dashboard</p><a href='/health'>Health</a>");
+        "<h3>Energy Monitor "+String(FW_VERSION)+
+        "</h3><p>Read-only dashboard</p><a href='/health'>Health</a>");
       return;
     }
+    if(!requireApWebPin())return;
     String h="<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>";
     h+="<body style='background:#071321;color:white;font:16px sans-serif'><h2>Energy Monitor "+String(FW_VERSION)+"</h2>";
-    h+="<p>CommonPlatform 1.06-compatible local provisioning.</p>";
-    h+="<form action='/save' method='post'>Setup code from display<br><input name='code' required><br>";
+    h+="<p>CommonPlatform v1.06: open WiFi AP + PIN 12134; 15-minute session.</p>";
+    h+="<form action='/save' method='post'>";
     h+="WiFi SSID<br><input name='ssid' maxlength='32' required><br>WiFi password<br><input type='password' name='wpass' maxlength='64'><br>";
     h+="HiveMQ host<br><input name='broker' size='38' maxlength='127' value='"+String(BROKER_DEFAULT)+"'><br>";
     h+="HiveMQ user<br><input name='user' maxlength='64' required><br>HiveMQ password<br><input name='mpass' type='password' maxlength='64' required><br>";
     h+="Price (euro/kWh)<br><input name='price' value='0.25'><br><br>";
     h+="<button type='submit'>Save & restart</button></form>";
     h+="<p><a href='/health'>Health JSON</a> | <a href='/ota'>Local OTA update</a></p>";
-    h+="<p>For OTA, use only the <b>Display2.8-app-only.bin</b> file; do not use the merged full BIN.</p>";
+    h+="<p>OTA requires <b>Display2.8-app-only.bin</b>, not the full merged BIN.</p>";
     h+="</body></html>";
+    webServer.sendHeader("Cache-Control","no-store");
     webServer.send(200,"text/html; charset=utf-8",h);
   });
   webServer.on("/save",HTTP_POST,[](){
-    if(!portalActive || !webServer.hasArg("code") || webServer.arg("code")!=portalCode) {
-      webServer.send(403,"text/plain","Invalid setup code");return;
-    }
+    if(!requireApWebPin())return;
     String ssid=webServer.arg("ssid"),host=webServer.arg("broker"),user=webServer.arg("user");
-    if(!ssid.length() || ssid.length()>32 || host.length()>127 || host.indexOf('/')>=0 ||
-       host.indexOf(':')>=0 || !host.length() || !user.length() || user.length()>64 ||
-       !webServer.arg("mpass").length() || webServer.arg("mpass").length()>64) {
+    String mpass=webServer.arg("mpass"),wpass=webServer.arg("wpass");
+    if(!ssid.length() || ssid.length()>32 || wpass.length()>64 ||
+       host.length()>127 || host.indexOf('/')>=0 || host.indexOf(':')>=0 ||
+       !host.length() || !user.length() || user.length()>64 ||
+       !mpass.length() || mpass.length()>64) {
       webServer.send(400,"text/plain","Invalid configuration");return;
     }
     settings.begin("energy28",false);
     settings.putString("ssid",ssid);
-    settings.putString("wpass",webServer.arg("wpass"));
+    settings.putString("wpass",wpass);
     settings.putString("user",user);
-    settings.putString("mpass",webServer.arg("mpass"));
+    settings.putString("mpass",mpass);
     settings.putString("broker",host);
     float price=webServer.arg("price").toFloat();
     settings.putFloat("price",(price>0.0f && price<10.0f)?price:0.25f);
@@ -449,28 +538,26 @@ void registerWebRoutes() {
     delay(400);ESP.restart();
   });
   webServer.on("/ota",HTTP_GET,[](){
-    if(!portalActive) {webServer.send(404,"text/plain","Closed");return;}
-    if(!webServer.authenticate("admin",portalCode.c_str())){webServer.requestAuthentication();return;}
+    if(!requireApWebPin())return;
     webServer.send(200,"text/html; charset=utf-8",
-      "<html><body><h3>Energy Monitor "+String(FW_VERSION)+" — Local OTA</h3>"
-      "<p>Use only <b>Display2.8-app-only.bin</b> (application image), NOT the full merged BIN.</p>"
+      "<html><body><h3>Energy Monitor "+String(FW_VERSION)+" - Local OTA</h3>"
+      "<p>Only <b>Display2.8-app-only.bin</b> (application image), NOT the full merged BIN.</p>"
       "<form method='POST' action='/update' enctype='multipart/form-data'>"
       "<input type='file' name='firmware' accept='.bin' required><button type='submit'>Update</button></form></body></html>");
   });
   webServer.on("/update",HTTP_POST,[](){
-    if(!portalActive || !webServer.authenticate("admin",portalCode.c_str())) {
-      webServer.requestAuthentication();return;
-    }
+    if(!requireApWebPin())return;
     bool ok=otaImageComplete && !Update.hasError();
     webServer.send(ok?200:500,"text/plain",ok?"OTA complete - rebooting":"OTA failed, old image retained");
     if(ok){delay(300);ESP.restart();}
   },[](){
-    if(!portalActive || !webServer.authenticate("admin",portalCode.c_str()))return;
+    if(!portalActive || !apWebSessionValid())return;
     HTTPUpload& u=webServer.upload();
     if(u.status==UPLOAD_FILE_START) {
       otaImageComplete=false;
-      if(u.filename!="Display2.8-app-only.bin" || !Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))
-        Serial.println("[OTA] begin failed or bad filename");
+      if(u.filename!="Display2.8-app-only.bin" ||
+         !Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))
+        Serial.println("[OTA] begin failed or incorrect app-only filename");
     } else if(u.status==UPLOAD_FILE_WRITE) {
       if(Update.isRunning() && Update.write(u.buf,u.currentSize)!=u.currentSize)
         Update.abort();
@@ -480,35 +567,76 @@ void registerWebRoutes() {
       Update.abort();otaImageComplete=false;
     }
   });
+  webServer.onNotFound([](){
+    if(portalActive) {
+      if(!requireApWebPin())return;
+      webServer.sendHeader("Location","/",true);
+      webServer.send(302,"text/plain","");
+    } else webServer.send(404,"text/plain","Not found");
+  });
   webServer.begin();
 }
 void beginPortal(bool recovery=false) {
   if(portalActive)return;
+  ++portalAttempts;
   setupMode=!recovery;
-  portalActive=true;
   apSsid="ESP28-SETUP-"+String((uint16_t)ESP.getEfuseMac(),HEX);
-  portalPassword=makeOneTimeSecret(12);
-  portalCode=makeOneTimeSecret(8);
   WiFi.mode(recovery?WIFI_AP_STA:WIFI_AP);
   if(!setTxLevel(0,"portal startup")) {
-    // Fail closed if a safe transmit-power ceiling cannot be set.
-    portalActive=false;Serial.println("[TX] Portal disabled until safe power set");return;
+    portalFailures++;portalRetryAt=millis()+30000;
+    Serial.println("[TX] Portal disabled until safe TX limit can be set");return;
   }
-  WiFi.softAPConfig(IPAddress(192,168,4,1),IPAddress(192,168,4,1),
-                    IPAddress(255,255,255,0));
-  if(!WiFi.softAP(apSsid.c_str(),portalPassword.c_str())) {
-    portalActive=false;Serial.println("[AP] failed to start");return;
+  uint8_t octet=portalOctet();
+  IPAddress ip(192,168,2,octet);
+  if(!WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) ||
+     !WiFi.softAP(apSsid.c_str(),nullptr,1,0,4)) {
+    portalFailures++;portalRetryAt=millis()+30000;
+    Serial.println("[AP] open AP start failed; 30s retry");return;
   }
+  portalActive=true;
+  portalStartMs=millis();
+  portalHealthMs=portalStartMs;
+  portalRetryAt=0;
+  resetApWebSession();
+  apPinFailures=0;apPinLockedUntil=0;
   registerWebRoutes();
-  Serial.printf("[AP] %s  URL http://192.168.4.1  (code shown on display)\n",
-                recovery?"AP+STA recovery":"AP-only provisioning");
+  portalDns.start(53,"*",WiFi.softAPIP());
+  apDnsRunning=true;
+  Serial.printf("[AP] OPEN, PIN 12134, %s at http://%s\n",
+    recovery?"AP+STA recovery":"AP-only setup",WiFi.softAPIP().toString().c_str());
   drawSetup();
+}
+void servicePortal() {
+  if(portalActive) {
+    if(apDnsRunning)portalDns.processNextRequest();
+    if(millis()-portalHealthMs>=3000) {
+      portalHealthMs=millis();
+      // Avoid repeatedly turning the radio off on transient readback failures.
+      if(millis()-portalStartMs>5000 &&
+         WiFi.getMode()!=WIFI_AP && WiFi.getMode()!=WIFI_AP_STA) {
+        portalActive=false;
+        if(apDnsRunning)portalDns.stop();
+        apDnsRunning=false;
+        resetApWebSession();
+        portalFailures++;
+        portalRetryAt=millis()+30000;
+        Serial.println("[AP] interface missing, retry scheduled");
+      }
+    }
+  } else if(portalRetryAt && dueAt(portalRetryAt)) {
+    portalRetryAt=0;
+    if(wifiSsid.isEmpty() || portalForced || (disconnectedSince && millis()-disconnectedSince>=20000))
+      beginPortal(!wifiSsid.isEmpty());
+  }
 }
 void stopRecoveryPortal() {
   if(!portalActive || !wifiSsid.length() || portalForced)return;
+  if(apDnsRunning)portalDns.stop();
+  apDnsRunning=false;
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   portalActive=false;
+  resetApWebSession();
   setupMode=false;
   render();
 }
@@ -674,7 +802,7 @@ void setup() {
   render();
 }
 void loop() {
-  // Serial: PORTAL enters maintenance AP with screen-displayed one-time code;
+  // Serial: PORTAL enters maintenance open AP with CommonPlatform PIN 12134;
   // CONFIG erases just this display's saved credentials (as in ver0.01).
   if(Serial.available()) {
     String cmd=Serial.readStringUntil('\n');cmd.trim();cmd.toUpperCase();
@@ -688,9 +816,10 @@ void loop() {
     }
   }
   if(routesReady)webServer.handleClient();
+  servicePortal();
   if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
-    if(!portalActive && dueAt(nextWifiAttempt)) {
-      nextWifiAttempt=millis()+10000;beginPortal(false);
+    if(!portalActive && !portalRetryAt && dueAt(nextWifiAttempt)) {
+      nextWifiAttempt=millis()+30000;beginPortal(false);
     }
     delay(10);return;
   }
