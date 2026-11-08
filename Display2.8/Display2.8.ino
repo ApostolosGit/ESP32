@@ -1,5 +1,5 @@
 /*
-  Energy Monitor 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.01 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -8,6 +8,8 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
+#define FW_VERSION "ver0.01"
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -184,7 +186,8 @@ void line(int x,int y,const String &label,const String &value,
 void topbar() {
   lcd->fillScreen(UI_BG);
   txt(7,3,"ENERGY MONITOR",UI_CYAN,2);
-  txt(270,7,mqtt.connected()?"MQTT":"OFF",mqtt.connected()?UI_GREEN:UI_RED,1);
+  txt(232,4,FW_VERSION,UI_CYAN,1);
+  txt(285,17,mqtt.connected()?"MQTT":"OFF",mqtt.connected()?UI_GREEN:UI_RED,1);
   const String tabNames[4]={"ΑΡΤΕΜΙΔΑ","ΝΕΣΤΟΥ 5Α","VENT","BOILER"};
   for(int i=0;i<4;i++) {
     int x=i*80+2;
@@ -320,6 +323,7 @@ void render() {
 void drawSetup() {
   lcd->fillScreen(UI_BG);
   txt(12,15,"ENERGY MONITOR",UI_CYAN,2);
+  txt(264,19,FW_VERSION,UI_CYAN,1);
   txt(14,53,"SETUP WIFI + MQTT",UI_YELLOW,2);
   txt(14,88,"Connect to WiFi AP:",UI_WHITE,1);
   txt(14,105,apSsid,UI_CYAN,2);
@@ -469,6 +473,7 @@ void handleTouch() {
 }
 void setup() {
   Serial.begin(115200);
+  Serial.printf("Energy Monitor firmware %s\n", FW_VERSION);
   pinMode(21,OUTPUT); digitalWrite(21,HIGH);
   lcd->begin();lcd->invertDisplay(true);
   SPI.begin(25,39,32,33);
