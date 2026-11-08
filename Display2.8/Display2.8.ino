@@ -32,7 +32,6 @@ Arduino_GFX *lcd = new Arduino_ST7789(lcdBus, GFX_NOT_DEFINED, 1, true, 240, 320
 Arduino_GFX *lcd = new Arduino_ILI9341(lcdBus, GFX_NOT_DEFINED, 1);
 #endif
 
-SPIClass touchSPI(VSPI);
 XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
 const char *tabNames[] = {"DDS", "JSY", "VENT", "BOILER"};
 int selectedTab = 0;
@@ -113,8 +112,8 @@ void setup() {
   lcd->invertDisplay(true);  // Typical CYD2USB ST7789 inversion
 #endif
 
-  touchSPI.begin(25, 39, 32, TOUCH_CS);
-  touch.begin(touchSPI);
+  SPI.begin(25, 39, 32, TOUCH_CS);
+  touch.begin();
   touch.setRotation(1);
 
   Serial.println("CYD 2.8-inch 4-tab test started (no splash screen)");
