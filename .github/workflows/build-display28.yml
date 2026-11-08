@@ -23,7 +23,8 @@ jobs:
           arduino-cli core install esp32:esp32@3.2.1 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli lib install 'GFX Library for Arduino'
           arduino-cli lib install 'XPT2046_Touchscreen'
-          python3 -m pip install --user esptool==4.8.1
+          python3 -m venv .esptool-venv
+          .esptool-venv/bin/pip install esptool==4.8.1
       - name: Compile for ESP32 Dev Module 4MB
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32:FlashSize=4M,FlashMode=dio,PartitionScheme=default --output-dir "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/Display2.8"
@@ -38,7 +39,7 @@ jobs:
           cp "$APP" Display2.8/Display2.8-app-only.bin
           BOOTAPP=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32" -name boot_app0.bin -print -quit)
           test -s "$BOOTAPP"
-          python3 -m esptool --chip esp32 merge_bin --flash_mode dio --flash_freq 40m --flash_size 4MB -o Display2.8/Display2.8.bin 0x1000 "$BOOT" 0x8000 "$PART" 0xe000 "$BOOTAPP" 0x10000 "$APP"
+          .esptool-venv/bin/python -m esptool --chip esp32 merge_bin --flash_mode dio --flash_freq 40m --flash_size 4MB -o Display2.8/Display2.8.bin 0x1000 "$BOOT" 0x8000 "$PART" 0xe000 "$BOOTAPP" 0x10000 "$APP"
           test -s Display2.8/Display2.8.bin
           sha256sum Display2.8/*.bin
       - name: Upload build artifacts
