@@ -7,6 +7,10 @@ on:
       - '.github/workflows/build-display28.yml'
   workflow_dispatch:
 
+concurrency:
+  group: display28-build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -61,6 +65,10 @@ jobs:
             0xe000 "$BOOTAPP" \
             0x10000 "$OUT/firmware.bin"
           test -s Display2.8/Display2.8.bin
+          VERSION=$(sed -n 's/^#define FW_VERSION "\(ver[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' Display2.8/Display2.8.ino)
+          if [ -n "$VERSION" ]; then
+            cp Display2.8/Display2.8.bin "Display2.8/Display2.8-$VERSION.bin"
+          fi
           sha256sum Display2.8/*.bin
       - name: Upload BIN artifacts
         uses: actions/upload-artifact@v4
@@ -69,11 +77,12 @@ jobs:
           path: |
             Display2.8/Display2.8.bin
             Display2.8/Display2.8-app-only.bin
+            Display2.8/Display2.8-ver*.bin
       - name: Publish BIN next to INO
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Display2.8/Display2.8.bin Display2.8/Display2.8-app-only.bin
+          git add Display2.8/*.bin
           if ! git diff --cached --quiet; then
             git commit -m "Build Display2.8 bootable firmware binaries"
             git push
