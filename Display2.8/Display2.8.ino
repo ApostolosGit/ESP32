@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.11 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.12 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.11"
+#define FW_VERSION "ver0.12"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -55,6 +55,17 @@ bool setupMode = false;
 uint8_t currentPage = 0;
 uint32_t lastMqttTry = 0, lastWifiTry = 0, lastPoll = 0, lastDraw = 0;
 uint32_t lastRx[4] = {0,0,0,0};
+// Text-only delta redraw: no 320x240 framebuffer and no per-MQTT full clear.
+struct ValueCell {
+  char last[48];
+  uint16_t color;
+  bool valid;
+};
+ValueCell visibleCells[24]={};
+int16_t visibleLayout=-1;
+bool uiRefreshPending=false;
+const uint32_t UI_REFRESH_MIN_MS=250UL;
+uint32_t fullScreenDraws=0,partialScreenDraws=0,unchangedCells=0;
 String ids[4];
 bool hasState[4] = {false,false,false,false};
 StaticJsonDocument<6144> state[4];
@@ -285,6 +296,9 @@ IPAddress portalIp() {
 String mqttDebugJson() {
   DynamicJsonDocument j(4096);
   j["firmware"]=FW_VERSION;
+  j["display_full_redraws"]=fullScreenDraws;
+  j["display_partial_redraws"]=partialScreenDraws;
+  j["display_unchanged_cells_skipped"]=unchangedCells;
   j["mqtt_connected"]=mqtt.connected();
   j["broker"]=broker;
   j["broker_port"]=8883;
@@ -443,6 +457,22 @@ String isoDay(int pg) {
 uint16_t powerColor(double n) {
   return !isfinite(n) ? UI_MUTED : n<0 ? UI_YELLOW : n>0 ? UI_RED : UI_WHITE;
 }
+// A unique cell ID identifies a variable value on the currently displayed tab.
+// Only the changed cell background is erased; labels/cards never blink.
+void drawValue(uint8_t slot,int x,int y,int w,int h,const String &value,
+               uint16_t fg,uint8_t size,uint16_t background=UI_PANEL) {
+  if(slot>=24)return;
+  ValueCell &cell=visibleCells[slot];
+  if(cell.valid && cell.color==fg && strcmp(cell.last,value.c_str())==0) {
+    unchangedCells++;
+    return;
+  }
+  if(cell.valid)lcd->fillRect(x,y,w,h,background);
+  txt(x,y,value,fg,size);
+  snprintf(cell.last,sizeof(cell.last),"%s",value.c_str());
+  cell.color=fg;
+  cell.valid=true;
+}
 void card(int x,int y,int w,int h) {
   lcd->fillRoundRect(x,y,w,h,7,UI_PANEL);
   lcd->drawRoundRect(x,y,w,h,7,UI_BORDER);
@@ -492,111 +522,135 @@ void footer() {
   txt(7,231,m,c,1);
   if(live(currentPage)) txt(255,231,String((millis()-lastRx[currentPage])/1000)+"s",UI_MUTED,1);
 }
-void ddsPage() {
-  txt(8,65,"ΜΕΤΡΗΤΗΣ ΔΕΗ ΑΡΤΕΜΙΔΑ",UI_WHITE,1);
-  card(5,79,310,140);
-  txt(12,88,"ΙΣΧΥΣ",UI_MUTED,1);
-  double p=live(0)?numberOf(0,"power"):NAN;
-  txt(102,82,fmt(p,0),powerColor(p),3);
-  txt(275,92,"W",UI_MUTED,2);
-  txt(12,120,"ΔΙΑΦΟΡΑ",UI_MUTED,1);
-  txt(106,116,live(0) && state[0]["has_utility"]==true &&
-    state[0]["estimate_valid"]==true?shown(0,"z_diff",2):"--",UI_RED,2);
-  txt(216,122,"kWh",UI_MUTED,1);
-  if(live(0) && state[0]["has_utility"]==true && state[0]["estimate_valid"]==true) {
-    double d=numberOf(0,"z_diff");
-    txt(256,122,"("+fmt(d*euroPerKwh,2)+"€)",UI_MUTED,1);
+void ddsPage(bool full) {
+  if(full) {
+    txt(8,65,"ΜΕΤΡΗΤΗΣ ΔΕΗ ΑΡΤΕΜΙΔΑ",UI_WHITE,1);
+    card(5,79,310,140);
+    txt(12,88,"ΙΣΧΥΣ",UI_MUTED,1);
+    txt(275,92,"W",UI_MUTED,2);
+    txt(12,120,"ΔΙΑΦΟΡΑ",UI_MUTED,1);
+    txt(216,122,"kWh",UI_MUTED,1);
+    txt(12,154,"ΕΚΤΙΜΗΣΗ",UI_MUTED,1);
+    txt(254,155,"kWh",UI_MUTED,1);
+    txt(12,190,"ΤΕΛ. ΔΕΗ",UI_MUTED,1);
+    txt(242,189,"kWh",UI_MUTED,1);
   }
-  txt(12,154,"ΕΚΤΙΜΗΣΗ",UI_MUTED,1);
-  txt(106,149,live(0)&&state[0]["estimate_valid"]==true?shown(0,"z_now",2):"--",UI_WHITE,2);
-  txt(254,155,"kWh",UI_MUTED,1);
-  txt(12,190,"ΤΕΛ. ΔΕΗ",UI_MUTED,1);
-  txt(106,182,live(0)&&state[0]["has_utility"]==true?shown(0,"z_ref",0):"--",UI_WHITE,2);
-  txt(242,189,"kWh",UI_MUTED,1);
-  txt(268,206,isoDay(0),UI_CYAN,1);
+  const bool active=live(0);
+  const double p=active?numberOf(0,"power"):NAN;
+  drawValue(0,102,82,170,25,fmt(p,0),powerColor(p),3);
+  const bool diffOk=active && state[0]["has_utility"]==true &&
+                    state[0]["estimate_valid"]==true;
+  drawValue(1,106,116,106,18,diffOk?shown(0,"z_diff",2):"--",UI_RED,2);
+  const double d=diffOk?numberOf(0,"z_diff"):NAN;
+  drawValue(2,256,122,58,9,isfinite(d)?"("+fmt(d*euroPerKwh,2)+"€)":"",UI_MUTED,1);
+  drawValue(3,106,149,144,18,active && state[0]["estimate_valid"]==true?
+    shown(0,"z_now",2):"--",UI_WHITE,2);
+  drawValue(4,106,182,132,18,active && state[0]["has_utility"]==true?
+    shown(0,"z_ref",0):"--",UI_WHITE,2);
+  drawValue(5,268,206,45,10,isoDay(0),UI_CYAN,1);
 }
-void jsyPage() {
-  txt(7,64,"ΝΕΣΤΟΥ 5Α",UI_WHITE,1);
-  txt(123,64,"ΣΥΝΟΛΙΚΗ ΙΣΧΥΣ",UI_MUTED,1);
+void jsyPage(bool full) {
+  if(full) {
+    txt(7,64,"ΝΕΣΤΟΥ 5Α",UI_WHITE,1);
+    txt(123,64,"ΣΥΝΟΛΙΚΗ ΙΣΧΥΣ",UI_MUTED,1);
+    txt(108,80,"W",UI_MUTED,1);
+  }
   double total=live(1)?numberOf(1,"power_total"):NAN;
-  if(isfinite(total) && total>0 && live(1) && (state[1]["power_direction"].as<int>() & 0x08))
-    total=-total;
-  txt(8,77,fmt(total,0),powerColor(total),2);
-  txt(108,80,"W",UI_MUTED,1);
+  if(isfinite(total) && total>0 && live(1) &&
+     (state[1]["power_direction"].as<int>() & 0x08))total=-total;
+  drawValue(0,8,77,96,19,fmt(total,0),powerColor(total),2,UI_BG);
   for(int i=0;i<3;i++) {
-    int x=4+i*106; card(x,99,101,44);
-    txt(x+6,105,"ΦΑΣΗ "+String("RST"[i]),UI_WHITE,1);
-    String f="p"+String(i+1);
+    int x=4+i*106;
+    if(full) {
+      card(x,99,101,44);
+      txt(x+6,105,"ΦΑΣΗ "+String("RST"[i]),UI_WHITE,1);
+    }
+    String f="p"+String(i+1),dir="dir"+String(i+1);
     double power=live(1)?numberOf(1,f.c_str()):NAN;
-    String dir="dir"+String(i+1);
-    if(isfinite(power) && power>0 && (String(state[1][dir] | "")=="REV" || (String(state[1][dir] | "").isEmpty() && numberOf(1,("i"+String(i+1)).c_str())<0))) power=-power;
-    txt(x+5,118,fmt(power,0),powerColor(power),2);
+    if(isfinite(power) && power>0 &&
+       (String(state[1][dir] | "")=="REV" ||
+       (String(state[1][dir] | "").isEmpty() &&
+        numberOf(1,("i"+String(i+1)).c_str())<0)))power=-power;
+    drawValue(1+i,x+5,118,90,20,fmt(power,0),powerColor(power),2);
   }
   for(int z=1;z<=2;z++) {
-    int x=z==1?4:162, w=154;
-    card(x,148,w,75);
-    txt(x+5,152,z==1?"Ζ1 ΑΚΡΙΒΟ":"Ζ2 ΟΙΚΟΝΟΜΙΚΟ",z==1?UI_WHITE:UI_CYAN,1);
-    const bool ok=live(1) && state[1]["has_utility"]==true && state[1]["estimate_valid"]==true;
+    int x=z==1?4:162,w=154;
+    if(full) {
+      card(x,148,w,75);
+      txt(x+5,152,z==1?"Ζ1 ΑΚΡΙΒΟ":"Ζ2 ΟΙΚΟΝΟΜΙΚΟ",
+          z==1?UI_WHITE:UI_CYAN,1);
+      txt(x+90,170,"kWh",UI_MUTED,1);
+      txt(x+59,182,"ΕΚΤ.",UI_MUTED,1);
+      txt(x+5,196,"ΔΕΗ",UI_MUTED,1);
+    }
+    bool ok=live(1) && state[1]["has_utility"]==true &&
+            state[1]["estimate_valid"]==true;
     String prefix="z"+String(z)+"_";
     double diff=ok?numberOf(1,(prefix+"diff").c_str()):NAN;
-    txt(x+5,163,fmt(diff,2),UI_RED,2);
-    txt(x+90,170,"kWh",UI_MUTED,1);
-    if(isfinite(diff))txt(x+5,182,fmt(diff*euroPerKwh,2)+"€",UI_MUTED,1);
-    txt(x+59,182,"ΕΚΤ.",UI_MUTED,1);
-    txt(x+90,182,live(1) && state[1]["estimate_valid"]==true?
+    const int slot=4+(z-1)*5;
+    drawValue(slot,x+5,163,82,18,fmt(diff,2),UI_RED,2);
+    drawValue(slot+1,x+5,182,51,9,isfinite(diff)?
+      fmt(diff*euroPerKwh,2)+"€":"",UI_MUTED,1);
+    drawValue(slot+2,x+90,182,60,9,live(1) &&
+      state[1]["estimate_valid"]==true?
       shown(1,(prefix+"now").c_str(),2):"--",UI_WHITE,1);
-    txt(x+5,196,"ΔΕΗ",UI_MUTED,1);
-    txt(x+41,196,live(1)&&state[1]["has_utility"]==true?
+    drawValue(slot+3,x+41,196,67,9,live(1) &&
+      state[1]["has_utility"]==true?
       shown(1,(prefix+"ref").c_str(),0):"--",UI_WHITE,1);
-    txt(x+109,210,isoDay(1),UI_MUTED,1);
+    drawValue(slot+4,x+109,210,43,9,isoDay(1),UI_MUTED,1);
   }
 }
-void ventPage() {
-  txt(8,65,"ΕΞΑΕΡΙΣΜΟΣ / VENTILATION",UI_WHITE,1);
+void ventPage(bool full) {
+  if(full)txt(8,65,"ΕΞΑΕΡΙΣΜΟΣ / VENTILATION",UI_WHITE,1);
   const char *keys[3]={"temp_outside","temp_inside","temp_middle"};
   const char *titles[3]={"ΕΞΩ","ΜΕΣΑ","ΕΝΔΙΑΜΕΣΑ"};
   for(int i=0;i<3;i++) {
     int x=4+i*106;
-    card(x,79,101,47);
-    txt(x+6,85,titles[i],UI_MUTED,1);
-    String v=shown(2,keys[i],1)+"°C";
-    txt(x+6,102,v,UI_WHITE,2);
+    if(full) {
+      card(x,79,101,47);
+      txt(x+6,85,titles[i],UI_MUTED,1);
+    }
+    drawValue(i,x+6,102,89,19,shown(2,keys[i],1)+"°C",UI_WHITE,2);
   }
-  card(4,132,312,65);
-  txt(10,136,"DHT11 OUTSIDE",UI_CYAN,1);
-  txt(150,136,shown(2,"dht_temp_outside",1)+"°C",UI_WHITE,1);
-  txt(224,136,"H "+shown(2,"humidity_outside",1)+"%",UI_WHITE,1);
-  txt(10,148,"AH "+shown(2,"absolute_humidity_outside",1)+"g/m3",UI_MUTED,1);
-  txt(182,148,"FEELS "+shown(2,"feels_like_outside",1)+"°C",UI_MUTED,1);
-  lcd->drawFastHLine(10,161,300,UI_BORDER);
-  txt(10,166,"DHT11 INSIDE",UI_CYAN,1);
-  txt(150,166,shown(2,"dht_temp_inside",1)+"°C",UI_WHITE,1);
-  txt(224,166,"H "+shown(2,"humidity_inside",1)+"%",UI_WHITE,1);
-  txt(10,179,"AH "+shown(2,"absolute_humidity_inside",1)+"g/m3",UI_MUTED,1);
-  txt(182,179,"FEELS "+shown(2,"feels_like_inside",1)+"°C",UI_MUTED,1);
-  card(4,200,312,24);
+  if(full) {
+    card(4,132,312,65);
+    txt(10,136,"DHT11 OUTSIDE",UI_CYAN,1);
+    lcd->drawFastHLine(10,161,300,UI_BORDER);
+    txt(10,166,"DHT11 INSIDE",UI_CYAN,1);
+    card(4,200,312,24);
+  }
+  drawValue(3,150,136,73,9,shown(2,"dht_temp_outside",1)+"°C",UI_WHITE,1);
+  drawValue(4,224,136,87,9,"H "+shown(2,"humidity_outside",1)+"%",UI_WHITE,1);
+  drawValue(5,10,148,170,9,"AH "+shown(2,"absolute_humidity_outside",1)+"g/m3",UI_MUTED,1);
+  drawValue(6,182,148,128,9,"FEELS "+shown(2,"feels_like_outside",1)+"°C",UI_MUTED,1);
+  drawValue(7,150,166,73,9,shown(2,"dht_temp_inside",1)+"°C",UI_WHITE,1);
+  drawValue(8,224,166,87,9,"H "+shown(2,"humidity_inside",1)+"%",UI_WHITE,1);
+  drawValue(9,10,179,170,9,"AH "+shown(2,"absolute_humidity_inside",1)+"g/m3",UI_MUTED,1);
+  drawValue(10,182,179,128,9,"FEELS "+shown(2,"feels_like_inside",1)+"°C",UI_MUTED,1);
   String mode=live(2)?String(state[2]["mode"]|"--"):"--";
   String fan=live(2)?(state[2]["fan_on"].as<bool>()?"ON":"OFF"):"--";
   String speed=live(2)?String(state[2]["speed"]|"--"):"--";
   String season=live(2)?String(state[2]["season"]|"--"):"--";
   bool safe=live(2) && state[2]["safe_mode"]==true;
-  txt(10,207,"MODE "+mode+"  FAN "+fan+"  "+speed, safe?UI_RED:UI_WHITE,1);
-  txt(227,207,season,UI_MUTED,1);
+  drawValue(11,10,207,214,9,"MODE "+mode+"  FAN "+fan+"  "+speed,
+            safe?UI_RED:UI_WHITE,1);
+  drawValue(12,227,207,83,9,season,UI_MUTED,1);
 }
-void boilerPage() {
-  txt(8,65,"BOILER / ΘΕΡΜΟΚΡΑΣΙΕΣ",UI_WHITE,1);
+void boilerPage(bool full) {
+  if(full)txt(8,65,"BOILER / ΘΕΡΜΟΚΡΑΣΙΕΣ",UI_WHITE,1);
   const char* labels[4]={"Θ1  GPIO5","Θ2  GPIO6","Θ3  GPIO7","Θ4  GPIO21"};
   for(int i=0;i<4;i++) {
-    int x=(i%2)*157+4;
-    int y=79+(i/2)*72;
-    card(x,y,152,68);
-    txt(x+9,y+7,labels[i],UI_MUTED,1);
-    String field="temp_"+String(i+1);
-    String statusField=field+"_status";
+    int x=(i%2)*157+4,y=79+(i/2)*72;
+    if(full) {
+      card(x,y,152,68);
+      txt(x+9,y+7,labels[i],UI_MUTED,1);
+    }
+    String field="temp_"+String(i+1),statusField=field+"_status";
     bool disconnected=live(3) &&
       String(state[3][statusField] | "")=="not connected";
     String value=disconnected?"NC":shown(3,field.c_str(),1)+"°C";
-    txt(x+9,y+28,value,disconnected?UI_RED:UI_WHITE,2);
+    drawValue(i,x+9,y+28,132,20,value,
+              disconnected?UI_RED:UI_WHITE,2);
   }
 }
 const char *debugNames[4]={"ΑΡΤΕΜΙΔΑ","ΝΕΣΤΟΥ 5Α","VENT","BOILER"};
@@ -688,23 +742,44 @@ void settingsPage() {
     txt(107,207,String(lastTouchRawX)+","+String(lastTouchRawY),UI_WHITE,1);
   }
 }
+// Header is static during MQTT updates; update only the small connection icon.
+void updateMqttIndicator() {
+  static bool drawn=false,lastConnected=false;
+  bool connected=mqtt.connected();
+  if(drawn && lastConnected==connected)return;
+  lcd->fillRect(246,16,43,12,UI_BG);
+  txt(248,18,connected?"MQTT":"OFF",connected?UI_GREEN:UI_RED,1);
+  drawn=true;lastConnected=connected;
+}
 void render() {
-  topbar();
+  const int16_t layout=settingsOpen?10+(int16_t)settingsPane:(int16_t)currentPage;
+  const bool full=(layout!=visibleLayout);
+  if(full) {
+    visibleLayout=layout;
+    memset(visibleCells,0,sizeof(visibleCells));
+    topbar(); // Full clear ONLY when switching tabs/settings/screens.
+    fullScreenDraws++;
+  } else {
+    partialScreenDraws++;
+    updateMqttIndicator();
+  }
   if(settingsOpen) {
-    settingsPage();
+    settingsPage(); // Diagnostics are refreshed less often than live sensor values.
   } else {
     switch(currentPage) {
-      case 0:ddsPage();break;
-      case 1:jsyPage();break;
-      case 2:ventPage();break;
-      case 3:boilerPage();break;
+      case 0:ddsPage(full);break;
+      case 1:jsyPage(full);break;
+      case 2:ventPage(full);break;
+      case 3:boilerPage(full);break;
     }
   }
   footer();
   lastDraw=millis();
+  uiRefreshPending=false;
 }
 // Preserve a readable TFT screen even when AP startup, TLS, or networking fails.
 void drawStartupStage(const String &stage, bool error=false) {
+  visibleLayout=-1; // A different screen is about to replace the dashboard.
   lcd->fillScreen(UI_BG);
   txt(10,9,"ENERGY MONITOR",UI_CYAN,2);
   txt(252,13,FW_VERSION,UI_CYAN,1);
@@ -717,6 +792,7 @@ void drawStartupStage(const String &stage, bool error=false) {
   Serial.printf("[DISPLAY] %s%s\n",error?"ERROR ":"",stage.c_str());
 }
 void drawSetup() {
+  visibleLayout=-1; // Force complete redraw on return to tabs.
   lcd->fillScreen(UI_BG);
   txt(12,15,"ENERGY MONITOR",UI_CYAN,2);
   txt(264,19,FW_VERSION,UI_CYAN,1);
@@ -1373,8 +1449,9 @@ void mqttMessage(char *topic,byte *payload,unsigned int len) {
     snprintf(lastUnknownTopic,sizeof(lastUnknownTopic),"%s",topic);
     return;
   }
-  if(settingsOpen && settingsPane==2)render();
-  else if(!settingsOpen && !portalActive && type==(int)currentPage)render();
+  if((settingsOpen && settingsPane==2) ||
+     (!settingsOpen && !portalActive && type==(int)currentPage))
+    uiRefreshPending=true; // Do not draw inside the MQTT network callback.
 }
 void readConfig() {
   settings.begin("energy28",true); // Keep backwards compatibility with ver0.01 NVS.
@@ -1693,7 +1770,9 @@ void loop() {
     if(displayOtaJob.pending)performDisplayOta();
   }
   if(restartAt && dueAt(restartAt)){delay(100);ESP.restart();}
-  if(millis()-lastDraw>10000UL && (!portalActive || settingsOpen))render();
+  if((!portalActive || settingsOpen) &&
+     ((uiRefreshPending && millis()-lastDraw>=UI_REFRESH_MIN_MS) ||
+      millis()-lastDraw>10000UL))render();
   if(millis()-lastHealthLine>60000UL) {
     lastHealthLine=millis();Serial.println(jsonStatus());
   }
