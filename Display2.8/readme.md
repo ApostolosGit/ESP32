@@ -1,10 +1,22 @@
-# Display2.8 — Energy Monitor ver0.11
+# Display2.8 — Energy Monitor ver0.12
 
 **Hardware:** ESP32-2432S028 dual-USB, ESP32-D0WD-V3 (classic ESP32), 4 MB flash, 320×240 landscape ST7789, XPT2046 resistive touch.
 
-**Latest firmware:** `Display2.8-ver0.11.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
+**Latest firmware:** `Display2.8-ver0.12.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
 
-The GitHub Actions build has succeeded. **ver0.11 is pending on-device testing. Compilation checks only verify buildability, not actual browser login, radio behavior or OTA.**
+The GitHub Actions build has succeeded. **ver0.12 has compiled successfully. The new delta-redraw behavior has not yet been checked on the physical TFT.**
+
+## New in ver0.12 (09/11/2026): Fix display flickering
+
+The previous firmware called `lcd->fillScreen(UI_BG)` each time an MQTT frame led to a refresh, clearing the entire display before drawing the whole interface again. This caused an obvious **full-screen blinking/repainting effect**, even when only one temperature or power number changed.
+
+- **No full-screen clearing on an ordinary MQTT update**. Full redraw now happens only on actual screen-layout changes (switching measurement tabs or entering/exiting/changing settings panels) or explicit boot/AP/recovery screens.
+- Static navigation tabs, headings, labels and card backgrounds stay in place; each measurement uses an independent **last-value + color cache**. Only modified values erase and redraw their small bounding rectangles. Unchanged fields are skipped.
+- MQTT receive callback schedules a lightweight UI update **outside the network callback**, throttled to at most 4 updates per second; this reduces SPI traffic and protects MQTT responsiveness.
+- The MQTT connection indicator and footer remain functional. `/health` includes `display_full_redraws`, `display_partial_redraws` and `display_unchanged_cells_skipped` counters for diagnostics.
+- The layout and Greek labels of DDS / JSY / VENT / BOILER remain the same; settings, AP recovery, the PIN-gated web page, remote OTA and Restart are not deliberately changed.
+- The build includes a complete **MERGED `Display2.8-ver0.12.bin`**, flash at **`0x000000`**; `Display2.8.bin` points to the same latest merged image. Always keep a full 4 MiB backup before writing.
+- This fixes the **verified software full-screen clear path**; if the physical screen continues blacking out, check the 5V power, LCD/backlight and serial reset reason, which cannot be validated by CI.
 
 ## New in ver0.11 (09/11/2026): Local CommonPlatform-style web administration
 
@@ -104,7 +116,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 | Filename | Function |
 | --- | --- |
-| `Display2.8-ver0.11.bin` | **MERGED full firmware**, write at **`0x000000`** |
+| `Display2.8-ver0.12.bin` | **MERGED full firmware**, write at **`0x000000`** |
 | `Display2.8.bin` | Latest **MERGED** firmware, same offset |
 | `Display2.8-app-only.bin` | App-only image for compatible existing partitions/OTA; **not** a merged image |
 | `Display2.8.ino` | Main source |
@@ -114,6 +126,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 ### Version history
 
+- **ver0.12 (09/11/2026):** Delta-based TFT drawing, unchanged-value caching, no full-screen clear on MQTT updates, limited redraw rate.
 - **ver0.11 (09/11/2026):** Local PIN-gated management website on LAN and AP; edit saved WiFi/MQTT credentials, view diagnostics, restart, clear credentials or upload app-only OTA; two-tap TFT OPEN AP.
 - **ver0.10 (09/11/2026):** AP+STA recovery, 60s saved-router retry, pause when AP client active, auto-close after stable router recovery.
 - **ver0.09 (09/11/2026):** Stable AP-only fallback with STA reconnections suspended while the AP is open, fixed AP name `ESP-Display28`, maximum 20 dBm requested TX (regulatory/hardware limited); correct on-screen AP-only label; verified matching app-only OTA file published to ESP32-OTA.bin. Compile successful, physical network and OTA testing outstanding.
