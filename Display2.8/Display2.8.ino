@@ -97,6 +97,8 @@ uint8_t apPinFailures=0;
 uint32_t portalStartMs=0, portalHealthMs=0, portalRetryAt=0, portalAttempts=0, portalFailures=0;
 uint32_t portalRadioRenewedAt=0,portalRadioRestarts=0;
 uint32_t nextRecoveryStaAttempt=0,lastRecoveryStaAttempt=0,lastPortalAccessAt=0;
+uint32_t recoveryRouterConnectedAt=0;
+const uint32_t RECOVERY_ROUTER_STABLE_MS=15000UL;
 uint32_t recoveryStaAttempts=0,recoveryStaFailures=0;
 int32_t recoveryStaLastError=0;
 const uint32_t RECOVERY_STA_RETRY_MS=60000UL; // Less scanning helps keep AP discoverable.
@@ -169,6 +171,8 @@ String jsonStatus() {
   j["ap_radio_restarts"]=portalRadioRestarts;
   j["ap_ssid"]=apSsid;
   j["ap_mode"]=portalActive?(portalRecoveryMode?"AP+STA":"AP_ONLY"):"OFF";
+  j["recovery_router_stable_sec"]=recoveryRouterConnectedAt && WiFi.status()==WL_CONNECTED?
+    (millis()-recoveryRouterConnectedAt)/1000UL:0;
   j["ap_clients"]=portalActive?WiFi.softAPgetStationNum():0;
   j["recovery_sta_attempts"]=recoveryStaAttempts;
   j["recovery_sta_failures"]=recoveryStaFailures;
@@ -868,7 +872,7 @@ void beginPortal(bool recovery=false) {
   }
   portalActive=true;
   portalStartMs=millis();portalHealthMs=portalStartMs;
-  lastPortalAccessAt=0;
+  lastPortalAccessAt=0;recoveryRouterConnectedAt=0;
   nextRecoveryStaAttempt=portalRecoveryMode?
       millis()+RECOVERY_STA_RETRY_MS:0;
   portalRetryAt=0;
@@ -908,16 +912,19 @@ void servicePortal() {
     // Periodically connect using the ESP-IDF STA interface. This starts a
     // *single* scan and NEVER calls WiFi.begin/mode/softAPdisconnect in-loop.
     // A scan may briefly interrupt SoftAP beacons: AP+STA shares one channel.
+    if(portalRecoveryMode && WiFi.status()!=WL_CONNECTED)
+      recoveryRouterConnectedAt=0;
     if(portalRecoveryMode && !portalForced && wifiSsid.length() &&
        WiFi.status()!=WL_CONNECTED && nextRecoveryStaAttempt &&
        dueAt(nextRecoveryStaAttempt)) {
-      if(lastPortalAccessAt &&
-         millis()-lastPortalAccessAt<RECOVERY_WEB_GRACE_MS) {
+      if(WiFi.softAPgetStationNum()>0) {
+        // One ESP32 radio: DO NOT scan while a phone is configuring the AP.
+        nextRecoveryStaAttempt=millis()+10000UL;
+      } else if(lastPortalAccessAt &&
+                millis()-lastPortalAccessAt<RECOVERY_WEB_GRACE_MS) {
         nextRecoveryStaAttempt=lastPortalAccessAt+RECOVERY_WEB_GRACE_MS;
       } else {
-        const uint32_t interval=WiFi.softAPgetStationNum()>0?
-            RECOVERY_STA_RETRY_MS+30000UL:RECOVERY_STA_RETRY_MS;
-        nextRecoveryStaAttempt=millis()+interval;
+        nextRecoveryStaAttempt=millis()+RECOVERY_STA_RETRY_MS;
         lastRecoveryStaAttempt=millis();
         ++recoveryStaAttempts;
         const esp_err_t error=esp_wifi_connect();
@@ -935,16 +942,29 @@ void servicePortal() {
   }
 }
 void stopRecoveryPortal() {
-  if(!portalActive || !portalRecoveryMode || portalForced ||
-     WiFi.status()!=WL_CONNECTED)return;
-  Serial.printf("[AP+STA] Router back, closing recovery AP (STA IP=%s)\n",
+  if(!portalActive || !portalRecoveryMode || portalForced)return;
+  if(WiFi.status()!=WL_CONNECTED || WiFi.localIP()==IPAddress(0,0,0,0)) {
+    recoveryRouterConnectedAt=0;return;
+  }
+  if(recoveryRouterConnectedAt==0) {
+    recoveryRouterConnectedAt=millis();
+    Serial.printf("[AP+STA] Router found (%s); waiting 15s before AP close\n",
+                  WiFi.localIP().toString().c_str());
+    return;
+  }
+  // Finish any active configuration before withdrawing the AP.
+  if(millis()-recoveryRouterConnectedAt<RECOVERY_ROUTER_STABLE_MS ||
+     WiFi.softAPgetStationNum()>0 ||
+     (lastPortalAccessAt && millis()-lastPortalAccessAt<RECOVERY_WEB_GRACE_MS))
+    return;
+  Serial.printf("[AP+STA] Router stable; closing recovery AP (STA IP=%s)\n",
                 WiFi.localIP().toString().c_str());
   if(apDnsRunning)portalDns.stop();
   apDnsRunning=false;
-  WiFi.softAPdisconnect(true); // Only AFTER STA has a confirmed connection.
+  WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
   portalActive=false;portalRecoveryMode=false;
-  nextRecoveryStaAttempt=0;
+  recoveryRouterConnectedAt=0;nextRecoveryStaAttempt=0;
   resetApWebSession();
   setupMode=false;
   render();
