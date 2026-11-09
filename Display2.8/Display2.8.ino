@@ -1531,6 +1531,23 @@ void maintainConnection() {
     Serial.printf("[MQTT] state=%d retry in %lu ms\n",mqtt.state(),(unsigned long)delayMs);
   }
 }
+// Two deliberate taps prevent accidental exposure of the maintenance AP.
+void requestLocalSetupPortal() {
+  if(portalActive) {
+    setupConfirmUntil=0;settingsOpen=false;drawSetup();return;
+  }
+  if(!setupConfirmUntil || dueAt(setupConfirmUntil)) {
+    setupConfirmUntil=millis()+8000UL;
+    render();
+    Serial.println("[WEB] Press OPEN AP again within 8s to enter maintenance");
+    return;
+  }
+  setupConfirmUntil=0;
+  settingsOpen=false;
+  portalForced=true; // Never silently close a user-requested maintenance AP.
+  Serial.println("[WEB] User requested maintenance AP from the touchscreen");
+  beginPortal(wifiSsid.length()>0);
+}
 void handleTouch() {
   static bool held=false;
   bool pressed=touch.touched();
@@ -1553,6 +1570,12 @@ void handleTouch() {
     return;
   }
   if(settingsOpen) {
+    if(settingsPane==0 && x>=200 && y>=196 && y<=223) {
+      requestLocalSetupPortal();return;
+    }
+    if(settingsPane==1 && x>=8 && x<=115 && y>=190 && y<=222) {
+      requestLocalSetupPortal();return;
+    }
     if(y>=29 && y<=63) {
       uint8_t pane=constrain(x/80,0,3);
       if(settingsPane!=pane){settingsPane=pane;render();}
@@ -1670,7 +1693,7 @@ void loop() {
     if(displayOtaJob.pending)performDisplayOta();
   }
   if(restartAt && dueAt(restartAt)){delay(100);ESP.restart();}
-  if(millis()-lastDraw>10000UL && !portalActive)render();
+  if(millis()-lastDraw>10000UL && (!portalActive || settingsOpen))render();
   if(millis()-lastHealthLine>60000UL) {
     lastHealthLine=millis();Serial.println(jsonStatus());
   }
