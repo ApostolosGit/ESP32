@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.09 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.10 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.09"
+#define FW_VERSION "ver0.10"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -87,7 +87,7 @@ void requestAll(); // Settings UI and MQTT callback can schedule polling
 // CommonPlatform 1.06-compatible network lifecycle for classic ESP32.
 // Deliberately NOT the C3-only platform source (target-specific adapters differ).
 bool portalActive=false, portalForced=false, routesReady=false, timeConfigured=false;
-bool apDnsRunning=false, pendingPortalStop=false;
+bool apDnsRunning=false, pendingPortalStop=false, portalRecoveryMode=false;
 const char AP_WEB_PIN[] = "12134"; // CommonPlatform 1.06
 const uint32_t AP_WEB_SESSION_MS = 15UL*60UL*1000UL;
 const uint32_t AP_PIN_COOLDOWN_MS = 30000UL;
@@ -96,6 +96,11 @@ uint32_t apWebSessionStartedMs=0, apPinLockedUntil=0;
 uint8_t apPinFailures=0;
 uint32_t portalStartMs=0, portalHealthMs=0, portalRetryAt=0, portalAttempts=0, portalFailures=0;
 uint32_t portalRadioRenewedAt=0,portalRadioRestarts=0;
+uint32_t nextRecoveryStaAttempt=0,lastRecoveryStaAttempt=0,lastPortalAccessAt=0;
+uint32_t recoveryStaAttempts=0,recoveryStaFailures=0;
+int32_t recoveryStaLastError=0;
+const uint32_t RECOVERY_STA_RETRY_MS=60000UL; // Less scanning helps keep AP discoverable.
+const uint32_t RECOVERY_WEB_GRACE_MS=20000UL; // Avoid interrupting portal form submissions.
 bool wifiEverConnected=false, mqttEverConnected=false, otaImageComplete=false;
 bool wifiCurrentlyConnected=false;
 uint32_t wifiFailures=0, mqttFailures=0, wifiReconnects=0, mqttReconnects=0;
@@ -163,6 +168,14 @@ String jsonStatus() {
   j["ap_active"]=portalActive;j["mqtt_connected"]=mqtt.connected();
   j["ap_radio_restarts"]=portalRadioRestarts;
   j["ap_ssid"]=apSsid;
+  j["ap_mode"]=portalActive?(portalRecoveryMode?"AP+STA":"AP_ONLY"):"OFF";
+  j["ap_clients"]=portalActive?WiFi.softAPgetStationNum():0;
+  j["recovery_sta_attempts"]=recoveryStaAttempts;
+  j["recovery_sta_failures"]=recoveryStaFailures;
+  j["recovery_sta_error"]=recoveryStaLastError;
+  j["recovery_next_retry_sec"]=portalActive && portalRecoveryMode &&
+    WiFi.status()!=WL_CONNECTED && !portalForced && nextRecoveryStaAttempt?
+      (dueAt(nextRecoveryStaAttempt)?0:(nextRecoveryStaAttempt-millis())/1000UL):-1;
   j["display_ota_busy"]=displayOtaBusy;
   j["ap_ip"]=portalActive?WiFi.softAPIP().toString():"";
   j["ap_pin_session_sec_left"]=portalActive && apWebSessionToken[0] &&
@@ -211,6 +224,7 @@ bool apWebSessionValid() {
   return false;
 }
 void sendPinPage(int status=200) {
+  lastPortalAccessAt=millis();
   webServer.sendHeader("Cache-Control","no-store");
   webServer.send(status,"text/html; charset=utf-8",
     "<!doctype html><html><head><meta name='viewport' "
@@ -224,11 +238,13 @@ void sendPinPage(int status=200) {
 }
 bool requireApWebPin() {
   if(!portalActive)return false;
+  lastPortalAccessAt=millis();
   if(apWebSessionValid())return true;
   sendPinPage(webServer.method()==HTTP_GET?200:403);
   return false;
 }
 void handleApWebLogin() {
+  lastPortalAccessAt=millis();
   if(!portalActive){webServer.send(404,"text/plain","Not found");return;}
   if(apPinLockedUntil && !dueAt(apPinLockedUntil)) {
     webServer.send(429,"text/plain","PIN temporarily locked. Try later.");
@@ -601,13 +617,13 @@ void settingsPage() {
     txt(204,158,txPowerVerified?String(TX_TENTHS[txLevel]/10)+"."+
         String(TX_TENTHS[txLevel]%10)+" dBm":"ERR",txPowerVerified?UI_GREEN:UI_RED,1);
     txt(11,174,"AP:",UI_MUTED,1);
-    txt(74,174,portalActive?"OPEN / PIN":"OFF",portalActive?UI_YELLOW:UI_MUTED,1);
+    txt(74,174,portalActive?(portalRecoveryMode?"AP+STA":"OPEN / PIN"):"OFF",portalActive?UI_YELLOW:UI_MUTED,1);
     txt(180,174,portalActive?WiFi.softAPIP().toString():"",UI_WHITE,1);
     txt(11,190,"WiFi RETRY:",UI_MUTED,1);
     txt(117,190,String(wifiReconnects),UI_WHITE,1);
     txt(168,190,"FAIL:",UI_MUTED,1);
     txt(218,190,String(wifiFailures),UI_RED,1);
-    txt(11,206,portalActive?"AP: ESP-Display28":"WEB: /network-debug",UI_CYAN,1);
+    txt(11,206,portalActive?(portalRecoveryMode?"AP+STA RETRY: "+String(recoveryStaAttempts):"AP: ESP-Display28"):"WEB: /network-debug",UI_CYAN,1);
   } else if(settingsPane==1) {
     txt(8,67,"MQTT DEBUG",UI_CYAN,2);
     card(4,87,312,137);
@@ -696,7 +712,7 @@ void drawSetup() {
   lcd->fillScreen(UI_BG);
   txt(12,15,"ENERGY MONITOR",UI_CYAN,2);
   txt(264,19,FW_VERSION,UI_CYAN,1);
-  txt(14,53,setupMode?"SETUP WIFI + MQTT":"AP-ONLY RECOVERY",UI_YELLOW,2);
+  txt(14,53,setupMode?"SETUP WIFI + MQTT":"AP+STA RECOVERY",UI_YELLOW,2);
   txt(14,88,"Connect to WiFi AP:",UI_WHITE,1);
   txt(14,105,apSsid,UI_CYAN,2);
   txt(14,135,"WiFi OPEN  PIN: 12134",UI_YELLOW,1);
@@ -820,48 +836,51 @@ void beginPortal(bool recovery=false) {
   if(portalActive)return;
   ++portalAttempts;
   setupMode=!recovery;
+  portalRecoveryMode=recovery && wifiSsid.length()>0;
   apSsid="ESP-Display28";
-  drawStartupStage(recovery?"AP-ONLY RECOVERY":"STARTING OPEN AP");
-  // ESP32 has one radio. Stop old STA association before starting rescue AP.
-  if(mqtt.connected())mqtt.disconnect();
-  tls.stop();wifiCurrentlyConnected=false;
+  drawStartupStage(portalRecoveryMode?"AP+STA RECOVERY":"STARTING OPEN AP");
+
+  // ESP32 uses ONE radio. Never switch AP+STA back to STA on each retry:
+  // doing so switches off the SoftAP and makes recovery disappear.
   WiFi.setAutoReconnect(false);
-  WiFi.disconnect(false,false);
-  if(!WiFi.mode(WIFI_AP)) {
-    portalFailures++;portalRetryAt=millis()+30000;
+  const wifi_mode_t wantedMode=portalRecoveryMode?WIFI_AP_STA:WIFI_AP;
+  if(!WiFi.mode(wantedMode)) {
+    portalFailures++;portalRetryAt=millis()+30000UL;
     drawStartupStage("AP radio mode failed",true);
     return;
   }
-  // Start the radio interface FIRST, then set and read back its TX ceiling.
-  // In ver0.04 the TX call preceded softAP() and failed with NOT_STARTED.
-  IPAddress ip=portalIp();
+  const IPAddress ip=portalIp();
   if(!WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) ||
      !WiFi.softAP(apSsid.c_str(),nullptr,1,0,4)) {
-    portalFailures++;portalRetryAt=millis()+30000;
-    Serial.println("[AP] open AP start failed; 30s retry");
-    drawStartupStage("AP start failed",true);return;
+    portalFailures++;portalRetryAt=millis()+30000UL;
+    Serial.println("[AP] AP+STA/SoftAP initialization failed; retrying");
+    drawStartupStage("AP start failed",true);
+    return;
   }
   txPowerVerified=false;
-  if(!setTxLevel(4,"AP MAX 20 dBm")) {
-    // Fail closed: do not leave an open AP transmitting at an unknown limit.
+  if(!setTxLevel(4,"AP+STA active, maximum TX")) {
+    // Do not knowingly continue with unknown TX configuration.
     WiFi.softAPdisconnect(true);
-    // Remain AP-only, retry access point instead of reconnecting the router.
-    portalFailures++;portalRetryAt=millis()+30000;
-    Serial.println("[TX] AP stopped: TX limit not verified");
-    drawStartupStage("AP TX verify failed",true);return;
+    portalFailures++;portalRetryAt=millis()+30000UL;
+    Serial.println("[AP] TX verification failed: retry");
+    drawStartupStage("AP TX verify failed",true);
+    return;
   }
   portalActive=true;
-  portalStartMs=millis();
-  portalRadioRenewedAt=portalStartMs;
-  portalHealthMs=portalStartMs;
+  portalStartMs=millis();portalHealthMs=portalStartMs;
+  lastPortalAccessAt=0;
+  nextRecoveryStaAttempt=portalRecoveryMode?
+      millis()+RECOVERY_STA_RETRY_MS:0;
   portalRetryAt=0;
   resetApWebSession();
   apPinFailures=0;apPinLockedUntil=0;
   registerWebRoutes();
   portalDns.start(53,"*",WiFi.softAPIP());
   apDnsRunning=true;
-  Serial.printf("[AP] OPEN PIN 12134 AP-ONLY recovery=%d at http://%s\n",
-    recovery?1:0,WiFi.softAPIP().toString().c_str());
+  Serial.printf("[AP] %s SSID=%s IP=%s; reconnect every %lus; forced=%d\n",
+    portalRecoveryMode?"AP+STA":"AP-only",apSsid.c_str(),
+    WiFi.softAPIP().toString().c_str(),
+    (unsigned long)(RECOVERY_STA_RETRY_MS/1000),portalForced?1:0);
   if(settingsOpen)render();else drawSetup();
 }
 void servicePortal() {
@@ -869,21 +888,45 @@ void servicePortal() {
     if(apDnsRunning)portalDns.processNextRequest();
     if(millis()-portalHealthMs>=3000UL) {
       portalHealthMs=millis();
-      wifi_mode_t mode=WiFi.getMode();
-      wifi_config_t cfg={};
-      const bool configOk=esp_wifi_get_config(WIFI_IF_AP,&cfg)==ESP_OK &&
-                        String((const char*)cfg.ap.ssid)==apSsid;
-      if(millis()-portalStartMs>5000UL && (mode!=WIFI_AP || !configOk)) {
+      const wifi_mode_t mode=WiFi.getMode();
+      wifi_config_t apCfg={};
+      const bool configOk=esp_wifi_get_config(WIFI_IF_AP,&apCfg)==ESP_OK &&
+                          String((const char*)apCfg.ap.ssid)==apSsid;
+      // In AP+STA the STA connection changes channel, not the SoftAP name.
+      const bool modeOk=mode==WIFI_AP_STA || (!portalRecoveryMode && mode==WIFI_AP);
+      if(millis()-portalStartMs>5000UL && (!modeOk || !configOk)) {
         if(apDnsRunning)portalDns.stop();
         apDnsRunning=false;portalActive=false;
         resetApWebSession();portalFailures++;
-        portalRetryAt=millis()+2000UL;
-        Serial.printf("[AP] missing mode=%d cfg=%d -> retry\n",(int)mode,configOk);
-        drawStartupStage("AP restart",true);
+        portalRetryAt=millis()+3000UL;
+        Serial.printf("[AP] Lost AP interface (mode=%d config=%d); retry\n",
+                      (int)mode,configOk);
+        drawStartupStage("AP interface recovery",true);
+        return;
       }
     }
-    // Intentionally NO WiFi.softAPdisconnect() after an idle timeout.
-    // No STA reconnect calls while AP is active. SSID stays advertised.
+    // Periodically connect using the ESP-IDF STA interface. This starts a
+    // *single* scan and NEVER calls WiFi.begin/mode/softAPdisconnect in-loop.
+    // A scan may briefly interrupt SoftAP beacons: AP+STA shares one channel.
+    if(portalRecoveryMode && !portalForced && wifiSsid.length() &&
+       WiFi.status()!=WL_CONNECTED && nextRecoveryStaAttempt &&
+       dueAt(nextRecoveryStaAttempt)) {
+      if(lastPortalAccessAt &&
+         millis()-lastPortalAccessAt<RECOVERY_WEB_GRACE_MS) {
+        nextRecoveryStaAttempt=lastPortalAccessAt+RECOVERY_WEB_GRACE_MS;
+      } else {
+        const uint32_t interval=WiFi.softAPgetStationNum()>0?
+            RECOVERY_STA_RETRY_MS+30000UL:RECOVERY_STA_RETRY_MS;
+        nextRecoveryStaAttempt=millis()+interval;
+        lastRecoveryStaAttempt=millis();
+        ++recoveryStaAttempts;
+        const esp_err_t error=esp_wifi_connect();
+        recoveryStaLastError=(int32_t)error;
+        if(error!=ESP_OK)++recoveryStaFailures;
+        Serial.printf("[AP+STA] saved SSID reconnect attempt %lu: %s (0x%X)\n",
+          (unsigned long)recoveryStaAttempts,esp_err_to_name(error),(unsigned)error);
+      }
+    }
   } else if(portalRetryAt && dueAt(portalRetryAt)) {
     portalRetryAt=0;
     if(wifiSsid.isEmpty() || portalForced ||
@@ -892,7 +935,19 @@ void servicePortal() {
   }
 }
 void stopRecoveryPortal() {
-  // User must save Wi-Fi settings and reboot; recovery AP does not auto-close.
+  if(!portalActive || !portalRecoveryMode || portalForced ||
+     WiFi.status()!=WL_CONNECTED)return;
+  Serial.printf("[AP+STA] Router back, closing recovery AP (STA IP=%s)\n",
+                WiFi.localIP().toString().c_str());
+  if(apDnsRunning)portalDns.stop();
+  apDnsRunning=false;
+  WiFi.softAPdisconnect(true); // Only AFTER STA has a confirmed connection.
+  WiFi.mode(WIFI_STA);
+  portalActive=false;portalRecoveryMode=false;
+  nextRecoveryStaAttempt=0;
+  resetApWebSession();
+  setupMode=false;
+  render();
 }
 int typeById(const String &id) {
   String n=id; n.toLowerCase();
@@ -1243,14 +1298,15 @@ void serviceDeviceProbes() {
 }
 void startStation() {
   if(portalActive) {
-    nextWifiAttempt=millis()+60000UL;return; // AP-only: NEVER scan/associate.
+    // Recovery STA retries run via esp_wifi_connect() in servicePortal().
+    nextWifiAttempt=millis()+RECOVERY_STA_RETRY_MS;return;
   }
   if(!WiFi.mode(WIFI_STA)) {
     Serial.println("[WiFi] STA radio mode failed");
     wifiFailures++;nextWifiAttempt=millis()+10000;return;
   }
   // The radio is started by WiFi.begin; TX setting is valid only afterwards.
-  // Escalate on subsequent connection attempts, capped at 15 dBm.
+  // Use the requested maximum for router acquisition; radio remains shared.
   uint8_t target=4; // MAX TX to reach newly configured router.
   WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
   txPowerVerified=false;
@@ -1265,7 +1321,6 @@ void startStation() {
   if(wifiRetryIdx<3)wifiRetryIdx++;
 }
 void maintainConnection() {
-  if(portalActive)return; // Suspend all STA retries until new configuration.
   if(WiFi.status()!=WL_CONNECTED) {
     if(wifiCurrentlyConnected) {
       wifiCurrentlyConnected=false;
@@ -1274,12 +1329,12 @@ void maintainConnection() {
       Serial.println("[WiFi] lost connection, MQTT transport stopped");
     }
     if(!disconnectedSince)disconnectedSince=millis();
-    if(dueAt(nextWifiAttempt) && wifiSsid.length()) {
+    if(!portalActive && dueAt(nextWifiAttempt) && wifiSsid.length()) {
       Serial.println("[WiFi] reconnecting");startStation();
     }
     if(!portalActive && (!portalRetryAt || dueAt(portalRetryAt)) &&
        wifiSsid.length() && millis()-disconnectedSince>20000UL) {
-      beginPortal(true); // Stable AP-only; STA retries suspended until setup saves credentials.
+      beginPortal(true); // AP+STA recovery: keep AP available and periodically retry STA.
     }
     return;
   }
@@ -1296,6 +1351,7 @@ void maintainConnection() {
     disconnectedSince=0;
     Serial.printf("[WiFi] recovered IP=%s\n",localIp().c_str());
   }
+  if(portalActive && !portalForced)stopRecoveryPortal();
   retuneWifi();
   if(time(nullptr)<1600000000 && millis()-lastNtpAttempt>30000UL) {
     configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4",
@@ -1451,7 +1507,7 @@ void setup() {
   }
   WiFi.setAutoReconnect(false);
   registerWebRoutes(); // Read-only /health on LAN; protected config in AP.
-  startStation();       // Nonblocking; AP+STA fallback after 20 seconds.
+  startStation();       // Nonblocking; fallback AP+STA after 20 seconds.
   Serial.println("[BOOT] Display and networking initialized");
 }
 void loop() {
