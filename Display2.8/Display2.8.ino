@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.07 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.08 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.07"
+#define FW_VERSION "ver0.08"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -105,17 +105,19 @@ uint8_t wifiRetryIdx=0, mqttRetryIdx=0, txLevel=0;
 bool txPowerVerified=false;
 int32_t lastTxError=0;
 
+// ESP-IDF max requested TX 80/4=20 dBm; actual radio power may be lower.
+const int8_t TX_MAX_QDBM=80;
 const wifi_power_t TX_STEPS[] = {WIFI_POWER_8_5dBm, WIFI_POWER_11dBm,
-                                WIFI_POWER_13dBm, WIFI_POWER_15dBm};
-const uint8_t TX_TENTHS[] = {85,110,130,150};
+  WIFI_POWER_13dBm, WIFI_POWER_15dBm, WIFI_POWER_19_5dBm};
+const uint16_t TX_TENTHS[] = {85,110,130,150,200};
 const uint32_t WIFI_RETRY_MS[] = {10000,15000,30000,60000};
 const uint32_t MQTT_BOOT_RETRY_MS[] = {10000,30000,60000,120000,300000};
 const uint32_t MQTT_RUN_RETRY_MS[] = {5000,10000,30000};
 bool dueAt(uint32_t target) {return (int32_t)(millis()-target)>=0;}
 String deviceId() {return String(DEVICE_ID_PREFIX)+String((uint32_t)ESP.getEfuseMac(),HEX);}
 bool setTxLevel(uint8_t level,const char *reason) {
-  if(level>3)level=3; // 15 dBm max, as CommonPlatform v1.06.
-  const int8_t desired=(int8_t)TX_STEPS[level]; // IDF units: quarter-dBm
+  if(level>4)level=4;
+  const int8_t desired=level==4?TX_MAX_QDBM:(int8_t)TX_STEPS[level];
   esp_err_t err=ESP_FAIL;
   // IDF requires Wi-Fi to have *started*; mode() alone can race the START event.
   // Do not use Arduino WiFi.setTxPower() before a running STA/AP interface.
@@ -141,10 +143,9 @@ bool setTxLevel(uint8_t level,const char *reason) {
   return true;
 }
 void retuneWifi() {
+  // Always MAX for the Display; never reduce it after an RSSI reading.
   if(WiFi.status()!=WL_CONNECTED || portalActive || millis()-lastTxTune<60000UL)return;
-  int rssi=WiFi.RSSI();
-  uint8_t target=(rssi>=-66)?0:(rssi>=-74)?1:(rssi>=-81)?2:3;
-  if(target!=txLevel)setTxLevel(target,"RSSI");
+  if(txLevel!=4 || !txPowerVerified)setTxLevel(4,"STA maximum");
   else lastTxTune=millis();
 }
 String localIp() {return WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():String("--");}
@@ -820,8 +821,13 @@ void beginPortal(bool recovery=false) {
   ++portalAttempts;
   setupMode=!recovery;
   apSsid="ESP-Display28";
-  drawStartupStage(recovery?"AP+STA RECOVERY":"STARTING OPEN AP");
-  if(!WiFi.mode(recovery?WIFI_AP_STA:WIFI_AP)) {
+  drawStartupStage(recovery?"STABLE AP RECOVERY":"STARTING OPEN AP");
+  // ESP32 has one radio. Stop old STA association before starting rescue AP.
+  if(mqtt.connected())mqtt.disconnect();
+  tls.stop();wifiCurrentlyConnected=false;
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false,false);
+  if(!WiFi.mode(WIFI_AP)) {
     portalFailures++;portalRetryAt=millis()+30000;
     drawStartupStage("AP radio mode failed",true);
     return;
@@ -836,12 +842,12 @@ void beginPortal(bool recovery=false) {
     drawStartupStage("AP start failed",true);return;
   }
   txPowerVerified=false;
-  if(!setTxLevel(3,"AP started - recovery visibility at 15 dBm")) {
+  if(!setTxLevel(4,"AP MAX 20 dBm")) {
     // Fail closed: do not leave an open AP transmitting at an unknown limit.
     WiFi.softAPdisconnect(true);
-    if(recovery && wifiSsid.length())WiFi.mode(WIFI_STA);
+    // Remain AP-only, retry access point instead of reconnecting the router.
     portalFailures++;portalRetryAt=millis()+30000;
-    Serial.println("[TX] AP stopped: cannot verify <=15 dBm TX power");
+    Serial.println("[TX] AP stopped: TX limit not verified");
     drawStartupStage("AP TX verify failed",true);return;
   }
   portalActive=true;
@@ -854,74 +860,39 @@ void beginPortal(bool recovery=false) {
   registerWebRoutes();
   portalDns.start(53,"*",WiFi.softAPIP());
   apDnsRunning=true;
-  Serial.printf("[AP] OPEN, PIN 12134, %s at http://%s\n",
-    recovery?"AP+STA recovery":"AP-only setup",WiFi.softAPIP().toString().c_str());
+  Serial.printf("[AP] OPEN PIN 12134 AP-ONLY recovery=%d at http://%s\n",
+    recovery?1:0,WiFi.softAPIP().toString().c_str());
   if(settingsOpen)render();else drawSetup();
 }
 void servicePortal() {
   if(portalActive) {
     if(apDnsRunning)portalDns.processNextRequest();
-    if(millis()-portalHealthMs>=3000) {
+    if(millis()-portalHealthMs>=3000UL) {
       portalHealthMs=millis();
-      const wifi_mode_t m=WiFi.getMode();
-      const bool modeOk=(m==WIFI_AP || m==WIFI_AP_STA);
-      wifi_config_t apCfg={};
-      const bool configOk=(esp_wifi_get_config(WIFI_IF_AP,&apCfg)==ESP_OK) &&
-                          String((const char*)apCfg.ap.ssid)==apSsid;
-      if(millis()-portalStartMs>5000 && (!modeOk || !configOk)) {
+      wifi_mode_t mode=WiFi.getMode();
+      wifi_config_t cfg={};
+      const bool configOk=esp_wifi_get_config(WIFI_IF_AP,&cfg)==ESP_OK &&
+                        String((const char*)cfg.ap.ssid)==apSsid;
+      if(millis()-portalStartMs>5000UL && (mode!=WIFI_AP || !configOk)) {
         if(apDnsRunning)portalDns.stop();
-        apDnsRunning=false;
-        portalActive=false;
+        apDnsRunning=false;portalActive=false;
         resetApWebSession();portalFailures++;
-        portalRetryAt=millis()+1500;
-        Serial.printf("[AP] LOST mode=%d config=%d; restarting\n",(int)m,configOk);
-        drawStartupStage("AP radio restart",true);
-        return;
-      }
-      // When searching for a new router, STA scans/associations can reconfigure
-      // the shared AP channel. If no phone connects, periodically re-beacon.
-      if(WiFi.status()!=WL_CONNECTED && WiFi.softAPgetStationNum()==0 &&
-         millis()-portalRadioRenewedAt>60000UL) {
-        portalRadioRenewedAt=millis();
-        portalRadioRestarts++;
-        Serial.printf("[AP] Reannounce %s (count %lu)\n",
-                      apSsid.c_str(),(unsigned long)portalRadioRestarts);
-        if(apDnsRunning)portalDns.stop();
-        apDnsRunning=false;
-        WiFi.softAPdisconnect(false);
-        delay(80);
-        const IPAddress ip=portalIp();
-        bool ok=WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) &&
-                WiFi.softAP(apSsid.c_str(),nullptr,1,0,4) &&
-                setTxLevel(3,"AP reannounce 15 dBm");
-        if(ok) {
-          portalDns.start(53,"*",WiFi.softAPIP());
-          apDnsRunning=true;
-          if(!settingsOpen)drawSetup();
-        } else {
-          portalActive=false;portalFailures++;
-          portalRetryAt=millis()+1500;
-          drawStartupStage("AP restart failed",true);
-        }
+        portalRetryAt=millis()+2000UL;
+        Serial.printf("[AP] missing mode=%d cfg=%d -> retry\n",(int)mode,configOk);
+        drawStartupStage("AP restart",true);
       }
     }
+    // Intentionally NO WiFi.softAPdisconnect() after an idle timeout.
+    // No STA reconnect calls while AP is active. SSID stays advertised.
   } else if(portalRetryAt && dueAt(portalRetryAt)) {
     portalRetryAt=0;
     if(wifiSsid.isEmpty() || portalForced ||
-       (disconnectedSince && millis()-disconnectedSince>=20000))
+       (disconnectedSince && millis()-disconnectedSince>=20000UL))
       beginPortal(!wifiSsid.isEmpty());
   }
 }
 void stopRecoveryPortal() {
-  if(!portalActive || !wifiSsid.length() || portalForced)return;
-  if(apDnsRunning)portalDns.stop();
-  apDnsRunning=false;
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
-  portalActive=false;
-  resetApWebSession();
-  setupMode=false;
-  render();
+  // User must save Wi-Fi settings and reboot; recovery AP does not auto-close.
 }
 int typeById(const String &id) {
   String n=id; n.toLowerCase();
@@ -1271,16 +1242,19 @@ void serviceDeviceProbes() {
   }
 }
 void startStation() {
-  if(!WiFi.mode(portalActive?WIFI_AP_STA:WIFI_STA)) {
+  if(portalActive) {
+    nextWifiAttempt=millis()+60000UL;return; // AP-only: NEVER scan/associate.
+  }
+  if(!WiFi.mode(WIFI_STA)) {
     Serial.println("[WiFi] STA radio mode failed");
     wifiFailures++;nextWifiAttempt=millis()+10000;return;
   }
   // The radio is started by WiFi.begin; TX setting is valid only afterwards.
   // Escalate on subsequent connection attempts, capped at 15 dBm.
-  uint8_t target=3; // Reliable router acquisition at 15 dBm (especially after router change).
+  uint8_t target=4; // MAX TX to reach newly configured router.
   WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
   txPowerVerified=false;
-  if(!setTxLevel(target,portalActive?"AP+STA stay visible":"STA started")) {
+  if(!setTxLevel(target,"STA MAX TX")) {
     WiFi.disconnect(false,false); // Stop association with an unverified TX cap.
     Serial.println("[WiFi] TX cap failed; STA attempt stopped");
     nextWifiAttempt=millis()+10000;wifiFailures++;return;
@@ -1291,6 +1265,7 @@ void startStation() {
   if(wifiRetryIdx<3)wifiRetryIdx++;
 }
 void maintainConnection() {
+  if(portalActive)return; // Suspend all STA retries until new configuration.
   if(WiFi.status()!=WL_CONNECTED) {
     if(wifiCurrentlyConnected) {
       wifiCurrentlyConnected=false;
@@ -1321,7 +1296,6 @@ void maintainConnection() {
     disconnectedSince=0;
     Serial.printf("[WiFi] recovered IP=%s\n",localIp().c_str());
   }
-  if(portalActive && !portalForced)stopRecoveryPortal();
   retuneWifi();
   if(time(nullptr)<1600000000 && millis()-lastNtpAttempt>30000UL) {
     configTzTime("EET-2EEST,M3.5.0/3,M10.5.0/4",
@@ -1475,6 +1449,7 @@ void setup() {
     beginPortal(true);
     return;
   }
+  WiFi.setAutoReconnect(false);
   registerWebRoutes(); // Read-only /health on LAN; protected config in AP.
   startStation();       // Nonblocking; AP+STA fallback after 20 seconds.
   Serial.println("[BOOT] Display and networking initialized");
