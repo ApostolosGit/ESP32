@@ -91,6 +91,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 ### Version history
 
 - **ver0.09 (09/11/2026):** Stable AP-only fallback with STA reconnections suspended while the AP is open, fixed AP name `ESP-Display28`, maximum 20 dBm requested TX (regulatory/hardware limited); correct on-screen AP-only label; verified matching app-only OTA file published to ESP32-OTA.bin. Compile successful, physical network and OTA testing outstanding.
+- **ver0.09 (09/11/2026):** Accurate AP-only status text; merged + OTA release verified by CI.
 - **ver0.08 (09/11/2026):** AP-only reliable recovery, 20 dBm requested TX, Wi-Fi name ESP-Display28; remote MQTT OTA and restart management.
 - **ver0.07 (09/11/2026):** Initial Display management and OTA protocol.
 - **ver0.06 (08/11/2026):** Settings gear, NET/MQTT/DEV/SYS screens, per-device MQTT traffic diagnostics, missing-state refresh and LAN debug endpoints.
