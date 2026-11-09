@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.10 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.11 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.10"
+#define FW_VERSION "ver0.11"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -69,6 +69,7 @@ struct SourceDebug {
 };
 SourceDebug sourceDebug[4];
 bool settingsOpen=false;
+uint32_t setupConfirmUntil=0;
 uint8_t settingsPane=0;
 uint32_t mqttPackets=0,mqttJsonErrors=0,mqttUnknown=0,mqttRequestTotal=0;
 uint32_t lastMqttPacketAt=0;
@@ -211,7 +212,7 @@ void resetApWebSession() {
   apWebSessionStartedMs=0;
 }
 bool apWebSessionValid() {
-  if(!portalActive || !apWebSessionToken[0])return false;
+  if(!apWebSessionToken[0])return false; // PIN session works on both LAN and recovery AP.
   if(millis()-apWebSessionStartedMs>=AP_WEB_SESSION_MS) {
     resetApWebSession();return false;
   }
@@ -241,15 +242,15 @@ void sendPinPage(int status=200) {
     "<button type='submit'>Open</button></form></body></html>");
 }
 bool requireApWebPin() {
-  if(!portalActive)return false;
-  lastPortalAccessAt=millis();
+  if(!portalActive && WiFi.status()!=WL_CONNECTED)return false;
+  if(portalActive)lastPortalAccessAt=millis();
   if(apWebSessionValid())return true;
   sendPinPage(webServer.method()==HTTP_GET?200:403);
   return false;
 }
 void handleApWebLogin() {
-  lastPortalAccessAt=millis();
-  if(!portalActive){webServer.send(404,"text/plain","Not found");return;}
+  if(portalActive)lastPortalAccessAt=millis();
+  if(!portalActive && WiFi.status()!=WL_CONNECTED){webServer.send(404,"text/plain","Not found");return;}
   if(apPinLockedUntil && !dueAt(apPinLockedUntil)) {
     webServer.send(429,"text/plain","PIN temporarily locked. Try later.");
     return;
@@ -627,7 +628,9 @@ void settingsPage() {
     txt(117,190,String(wifiReconnects),UI_WHITE,1);
     txt(168,190,"FAIL:",UI_MUTED,1);
     txt(218,190,String(wifiFailures),UI_RED,1);
-    txt(11,206,portalActive?(portalRecoveryMode?"AP+STA RETRY: "+String(recoveryStaAttempts):"AP: ESP-Display28"):"WEB: /network-debug",UI_CYAN,1);
+    txt(11,206,"WEB: "+(portalActive?WiFi.softAPIP().toString():localIp()),UI_CYAN,1);
+    lcd->fillRoundRect(206,198,105,24,5,UI_ACTIVE);
+    txt(213,206,setupConfirmUntil && !dueAt(setupConfirmUntil)?"CONFIRM":"OPEN AP",UI_WHITE,1);
   } else if(settingsPane==1) {
     txt(8,67,"MQTT DEBUG",UI_CYAN,2);
     card(4,87,312,137);
@@ -652,7 +655,8 @@ void settingsPage() {
     txt(11,165,"LAST:",UI_MUTED,1);
     txt(58,165,String(lastMqttTopic).substring(0,41),UI_WHITE,1);
     if(lastMqttError[0])txt(11,180,String(lastMqttError).substring(0,48),UI_RED,1);
-    txt(11,195,"/mqtt-status",UI_CYAN,1);
+    lcd->fillRoundRect(9,190,103,27,5,UI_ACTIVE);
+    txt(18,199,setupConfirmUntil && !dueAt(setupConfirmUntil)?"CONFIRM":"OPEN AP",UI_WHITE,1);
     lcd->fillRoundRect(208,190,101,27,5,UI_ACTIVE);
     txt(218,199,"REFRESH",UI_WHITE,1);
   } else if(settingsPane==2) {
@@ -725,6 +729,22 @@ void drawSetup() {
   txt(14,217,"No credentials on GitHub",UI_MUTED,1);
   drawGear();
 }
+// CommonPlatform-aligned maintenance web UI, with extra PIN protection on LAN.
+// Open Wi-Fi AP itself remains unencrypted; passwords are NEVER embedded in HTML.
+String safeHtml(const String &input) {
+  String out;out.reserve(input.length()+8);
+  for(size_t i=0;i<input.length();i++) {
+    switch(input[i]) {
+      case '&':out+="&amp;";break;
+      case '<':out+="&lt;";break;
+      case '>':out+="&gt;";break;
+      case '"':out+="&quot;";break;
+      case '\'':out+="&#39;";break;
+      default:out+=input[i];break;
+    }
+  }
+  return out;
+}
 // CommonPlatform 1.06 open-AP PIN with a 15-minute scoped cookie session.
 // While the portal is active, all HTTP pages and actions require authentication.
 void registerWebRoutes() {
@@ -749,53 +769,136 @@ void registerWebRoutes() {
     webServer.send(200,"application/json; charset=utf-8",mqttDebugJson());
   });
   webServer.on("/",HTTP_GET,[](){
-    if(!portalActive) {
-      webServer.send(200,"text/html; charset=utf-8",
-        "<h3>Energy Monitor "+String(FW_VERSION)+
-        "</h3><p>Read-only dashboard</p>"
-        "<p><a href='/network-debug'>Network Debug</a> | "
-        "<a href='/mqtt-status'>MQTT / Devices Debug</a></p>");
-      return;
-    }
     if(!requireApWebPin())return;
-    String h="<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>";
-    h+="<body style='background:#071321;color:white;font:16px sans-serif'><h2>Energy Monitor "+String(FW_VERSION)+"</h2>";
-    h+="<p>CommonPlatform v1.06: open WiFi AP + PIN 12134; 15-minute session.</p>";
-    h+="<form action='/save' method='post'>";
-    h+="WiFi SSID<br><input name='ssid' maxlength='32' required><br>WiFi password<br><input type='password' name='wpass' maxlength='64'><br>";
-    h+="HiveMQ host<br><input name='broker' size='38' maxlength='127' value='"+String(BROKER_DEFAULT)+"'><br>";
-    h+="HiveMQ user<br><input name='user' maxlength='64' required><br>HiveMQ password<br><input name='mpass' type='password' maxlength='64' required><br>";
-    h+="Price (euro/kWh)<br><input name='price' value='0.25'><br><br>";
-    h+="<button type='submit'>Save & restart</button></form>";
-    h+="<p><a href='/network-debug'>Network Debug</a> | ";
-    h+="<a href='/mqtt-status'>MQTT / Devices Debug</a> | ";
-    h+="<a href='/ota'>Local OTA update</a></p>";
-    h+="<p>OTA requires <b>Display2.8-app-only.bin</b>, not the full merged BIN.</p>";
+    String h;h.reserve(3600);
+    h+="<!doctype html><html lang='el'><head><meta charset='utf-8'>";
+    h+="<meta name='viewport' content='width=device-width,initial-scale=1'>";
+    h+="<title>Display28 Setup</title><style>";
+    h+="body{font:16px system-ui,sans-serif;background:#081622;color:#f0f7ff;";
+    h+="max-width:680px;margin:auto;padding:18px}h1{font-size:24px}";
+    h+=".card{background:#112639;border:1px solid #34546d;border-radius:12px;";
+    h+="padding:16px;margin:12px 0}label{display:block;margin-top:10px}";
+    h+="input,button{box-sizing:border-box;padding:11px;font:inherit;border-radius:7px}";
+    h+="input{width:100%;background:#fff;color:#111}button{margin:12px 7px 0 0}";
+    h+="a{color:#8fdaff}small{color:#bed2e0}code{word-break:break-all}</style></head><body>";
+    h+="<h1>Display 2.8 - "+String(FW_VERSION)+"</h1>";
+    h+="<div class='card'><b>Network</b><p>WiFi: ";
+    h+=WiFi.status()==WL_CONNECTED?"Connected":"Offline / AP";
+    h+=" | IP: <code>"+safeHtml(localIp())+"</code></p>";
+    h+="<p>AP: ";
+    h+=portalActive?"ON":"OFF";
+    h+=" | MQTT: ";
+    h+=mqtt.connected()?"CONNECTED":"DISCONNECTED";
+    h+="</p><p>RSSI: "+String(WiFi.status()==WL_CONNECTED?WiFi.RSSI():-127)+" dBm";
+    h+=" | MQTT state: "+String(mqtt.state())+"</p>";
+    h+="<a href='/network-debug'>Network debug JSON</a> | ";
+    h+="<a href='/mqtt-status'>MQTT/device debug JSON</a> | ";
+    h+="<a href='/debug.txt'>Diagnostics text</a></div>";
+    h+="<div class='card'><h2>Wi-Fi / MQTT configuration</h2>";
+    h+="<small>Leave a password blank to preserve it for the same network / broker.";
+    h+=" No passwords are displayed or downloaded.</small>";
+    h+="<form action='/save' method='post' autocomplete='off'>";
+    h+="<label>WiFi SSID<input name='ssid' maxlength='32' required value='";
+    h+=safeHtml(wifiSsid);h+="'></label>";
+    h+="<label>WiFi password<input name='wpass' type='password' maxlength='64'";
+    h+=" placeholder='Keep existing if unchanged'></label>";
+    h+="<label>HiveMQ host<input name='broker' maxlength='127' required value='";
+    h+=safeHtml(broker);h+="'></label>";
+    h+="<label>HiveMQ username<input name='user' maxlength='64' required value='";
+    h+=safeHtml(mqttUser);h+="'></label>";
+    h+="<label>HiveMQ password<input name='mpass' type='password' maxlength='64'";
+    h+=" placeholder='Keep existing if blank'></label>";
+    h+="<label>Price EUR/kWh<input name='price' inputmode='decimal' value='";
+    h+=String(euroPerKwh,3);h+="'></label>";
+    h+="<button type='submit'>Save settings & restart</button></form></div>";
+    h+="<div class='card'><h2>Maintenance</h2>";
+    h+="<p><a href='/ota'>Local app-only OTA</a> | ";
+    h+="<a href='/restart-esp'>Restart device</a> | ";
+    h+="<a href='/forget-credentials-confirm'>Reset saved credentials</a></p>";
+    h+="<small>PIN session expires in 15 minutes. HTTP on the open recovery AP ";
+    h+="is not encrypted. Use this interface only on a trusted network.</small></div>";
     h+="</body></html>";
     webServer.sendHeader("Cache-Control","no-store");
     webServer.send(200,"text/html; charset=utf-8",h);
   });
+  webServer.on("/setup",HTTP_GET,[](){
+    webServer.sendHeader("Location","/",true);
+    webServer.send(302,"text/plain","");
+  });
+  webServer.on("/debug.txt",HTTP_GET,[](){
+    if(!requireApWebPin())return;
+    webServer.sendHeader("Cache-Control","no-store");
+    webServer.send(200,"text/plain; charset=utf-8",
+      "Display28 "+String(FW_VERSION)+"\n\nNETWORK\n"+jsonStatus()+
+      "\n\nMQTT\n"+mqttDebugJson()+"\n");
+  });
   webServer.on("/save",HTTP_POST,[](){
     if(!requireApWebPin())return;
+    if(displayOtaBusy || displayOtaJob.pending) {
+      webServer.send(409,"text/plain","OTA running, settings unavailable");return;
+    }
     String ssid=webServer.arg("ssid"),host=webServer.arg("broker"),user=webServer.arg("user");
-    String mpass=webServer.arg("mpass"),wpass=webServer.arg("wpass");
-    if(!ssid.length() || ssid.length()>32 || wpass.length()>64 ||
+    String newWifiPass=webServer.arg("wpass"),newMqttPass=webServer.arg("mpass");
+    ssid.trim();host.trim();user.trim();
+    if(newWifiPass.isEmpty() && ssid==wifiSsid)newWifiPass=wifiPass;
+    if(newMqttPass.isEmpty())newMqttPass=mqttPass;
+    if(!ssid.length() || ssid.length()>32 || newWifiPass.length()>64 ||
        host.length()>127 || host.indexOf('/')>=0 || host.indexOf(':')>=0 ||
        !host.length() || !user.length() || user.length()>64 ||
-       !mpass.length() || mpass.length()>64) {
-      webServer.send(400,"text/plain","Invalid configuration");return;
+       !newMqttPass.length() || newMqttPass.length()>64) {
+      webServer.send(400,"text/plain","Invalid WiFi or MQTT configuration");return;
     }
     settings.begin("energy28",false);
     settings.putString("ssid",ssid);
-    settings.putString("wpass",wpass);
+    settings.putString("wpass",newWifiPass);
     settings.putString("user",user);
-    settings.putString("mpass",mpass);
+    settings.putString("mpass",newMqttPass);
     settings.putString("broker",host);
     float price=webServer.arg("price").toFloat();
     settings.putFloat("price",(price>0.0f && price<10.0f)?price:0.25f);
     settings.end();
-    webServer.send(200,"text/html","Saved. Device restarting.");
-    delay(400);ESP.restart();
+    webServer.sendHeader("Cache-Control","no-store");
+    webServer.send(200,"text/html; charset=utf-8",
+      "<h2>Saved. Device restarting.</h2><p>Connect to the configured router again.</p>");
+    restartAt=millis()+1400UL;
+  });
+  webServer.on("/restart-esp",HTTP_GET,[](){
+    if(!requireApWebPin())return;
+    webServer.send(200,"text/html; charset=utf-8",
+      "<html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<h2>Restart Display2.8</h2><p>Saved WiFi/MQTT settings will be kept.</p>"
+      "<form method='post' action='/restart-esp'>"
+      "<input type='hidden' name='confirm' value='RESTART'>"
+      "<button type='submit'>Confirm restart</button></form>"
+      "<p><a href='/'>Cancel</a></p></html>");
+  });
+  webServer.on("/restart-esp",HTTP_POST,[](){
+    if(!requireApWebPin())return;
+    if(webServer.arg("confirm")!="RESTART" || displayOtaBusy || displayOtaJob.pending) {
+      webServer.send(409,"text/plain","Restart not confirmed or OTA busy");return;
+    }
+    webServer.send(200,"text/plain","Restarting Display2.8");
+    restartAt=millis()+1400UL;
+  });
+  webServer.on("/forget-credentials-confirm",HTTP_GET,[](){
+    if(!requireApWebPin())return;
+    webServer.send(200,"text/html; charset=utf-8",
+      "<html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<h2>Clear saved Wi-Fi and MQTT?</h2>"
+      "<p>This clears only Display2.8 credentials. Do not use for normal edits.</p>"
+      "<form action='/forget-credentials' method='post'>"
+      "Type ERASE to confirm: <input name='confirm' required>"
+      "<button type='submit'>Erase settings and restart</button></form>"
+      "<p><a href='/'>Cancel</a></p></html>");
+  });
+  webServer.on("/forget-credentials",HTTP_POST,[](){
+    if(!requireApWebPin())return;
+    if(webServer.arg("confirm")!="ERASE" || displayOtaBusy || displayOtaJob.pending) {
+      webServer.send(409,"text/plain","Credentials erase not confirmed");return;
+    }
+    settings.begin("energy28",false);settings.clear();settings.end();
+    webServer.send(200,"text/plain","Only this device's saved credentials cleared; restarting");
+    restartAt=millis()+1400UL;
   });
   webServer.on("/ota",HTTP_GET,[](){
     if(!requireApWebPin())return;
@@ -811,7 +914,7 @@ void registerWebRoutes() {
     webServer.send(ok?200:500,"text/plain",ok?"OTA complete - rebooting":"OTA failed, old image retained");
     if(ok){delay(300);ESP.restart();}
   },[](){
-    if(!portalActive || !apWebSessionValid())return;
+    if((!portalActive && WiFi.status()!=WL_CONNECTED) || !apWebSessionValid())return;
     HTTPUpload& u=webServer.upload();
     if(u.status==UPLOAD_FILE_START) {
       otaImageComplete=false;
