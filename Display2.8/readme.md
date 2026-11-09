@@ -1,10 +1,19 @@
-# Display2.8 — Energy Monitor ver0.12
+# Display2.8 — Energy Monitor ver0.13
 
 **Hardware:** ESP32-2432S028 dual-USB, ESP32-D0WD-V3 (classic ESP32), 4 MB flash, 320×240 landscape ST7789, XPT2046 resistive touch.
 
-**Latest firmware:** `Display2.8-ver0.12.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
+**Latest firmware:** `Display2.8-ver0.13.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
 
-The GitHub Actions build has succeeded. **ver0.12 has compiled successfully. The new delta-redraw behavior has not yet been checked on the physical TFT.**
+The GitHub Actions build has succeeded. **ver0.13 compiled successfully; HTTPS OTA and firmware flash still require a physical device test.**
+
+## New in ver0.13 (09/11/2026): Trusted OTA HTTPS fix and setup PIN UI
+
+- **Root-certificate fix:** Previous Display firmware carried only DigiCert Global Root G2 for GitHub HTTPS. Recent `raw.githubusercontent.com` certificate chains have used Let's Encrypt ISRG Root X1. The new `GithubCA.h` includes **both public roots** in a verified-TLS trust bundle; `setInsecure()` is never used. This is a plausible explanation for `https_http_-1`, not yet hardware-confirmed.
+- **Improved OTA diagnostics:** Explicit GitHub DNS resolution, heap statistics, TLS handshake error reporting and up to three HTTPS GET attempts before any firmware flash writes. Still enforces GitHub firmware URL allowlist, expected app image size, hardware profile and expected MD5.
+- **No PIN-length hints:** Display's PIN web form simply asks for the device PIN, without advertising the number of digits, a minimum length, or a fixed count in its placeholder. The TFT setup screen no longer prints the PIN itself. The device continues validating the configured PIN in firmware with throttling.
+- **MQTT.app v5.98:** Display card has a new **Τοπικό OTA** button, opening the device's existing local `/ota` page at the recorded private LAN IP. The public APP no longer embeds the fixed PIN in its JavaScript and no longer announces its length. Other measurement cards remain intact.
+- **First-install recovery:** Firmware already running ver0.11/ver0.12 cannot acquire new CA roots until its app image has been upgraded. Download the latest unversioned `Display2.8-app-only.bin` from the source repo (correct upload filename), open the Display's `http://<display-lan-ip>/ota` via its local web interface, authenticate with the device PIN, select that **app-only** file and upload. The older web upload handler accepts only the literal filename `Display2.8-app-only.bin`, so do not select the versioned OTA file without renaming it. This action does **not** require remote GitHub access from the old ESP32 firmware.
+- **Fallback:** `Display2.8-ver0.13.bin` is the **MERGED** USB-flash firmware at address `0x000000`. Keep a complete 4 MiB flash backup before writing merged firmware.
 
 ## New in ver0.12 (09/11/2026): Fix display flickering
 
@@ -33,7 +42,7 @@ The Display2.8 runs a local HTTP server on **both the home LAN and the recovery 
 ## New in ver0.10 (09/11/2026): Hybrid AP+STA auto-recovery
 
 - Normal operation: ESP32 connects to the configured router in **STA-only**, keeping its open `ESP-Display28` AP off.
-- If that router remains unavailable for roughly **20 seconds**, a recovery AP appears as `ESP-Display28` with **no Wi-Fi password**, browser PIN **12134**, and the AP address shown on the screen (usually `http://192.168.4.1`).
+- If that router remains unavailable for roughly **20 seconds**, a recovery AP appears as `ESP-Display28` with **no Wi-Fi password**, browser PIN **(device PIN)**, and the AP address shown on the screen (usually `http://192.168.4.1`).
 - The recovery radio stays in **WIFI_AP_STA mode**; unlike ver0.09, it checks the **saved router every 60 seconds** with `esp_wifi_connect()`, without resetting the SoftAP.
 - **While a phone is connected to the AP, router reconnection attempts pause.** Web activity also provides a 20-second quiet period to protect settings submissions. ESP32 has one radio, so an active STA scan can nevertheless briefly disturb SoftAP beacons.
 - When router association and IP are valid for at least **15 continuous seconds**, recovery AP automatically closes only **if no AP client is connected and no recent web configuration is in progress**. Normal MQTT reconnects then resume.
@@ -44,7 +53,7 @@ The Display2.8 runs a local HTTP server on **both the home LAN and the recovery 
 
 ## What's new in ver0.09 (09/11/2026)
 
-- **Fixed Access Point name:** `ESP-Display28`, open 2.4 GHz Wi-Fi, no connection password. Web setup PIN **12134**, 15-minute cookie.
+- **Fixed Access Point name:** `ESP-Display28`, open 2.4 GHz Wi-Fi, no connection password. Web setup PIN **(device PIN)**, 15-minute cookie.
 - **Stable AP-only router recovery:** on repeated failed router association, stops STA association and leaves Wi-Fi in **AP-only mode**. This avoids the ESP32 shared radio's STA scans/channels hiding the AP from phones. Old router credentials are replaced after using the AP page and saving/rebooting.
 - **TX power in latest ver0.09:** explicit **requested maximum 20.0 dBm** for AP/STA (the earlier v0.07 used 15.0 dBm, and original CommonPlatform v1.06 is capped at 15.0 dBm). Actual calibrated/radiated TX depends on chip, country, antenna and SDK; software request is not a measurement. This is a deliberate divergence from CommonPlatform's TX cap, and must comply with local radio rules.
 - **Management device identity:** `home/energy/display28-<chip>/health`, `/state` and retained `/status`. Announces the hardware profile `esp32-display28-st7789` and OTA protocol `2`. The original four measurements are unchanged.
@@ -103,7 +112,7 @@ Missing/stale measurements show `--`; no MQTT controls are sent. `REFRESH` only 
 This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 behavior; the original CommonPlatform code targets the **ESP32-C3** and cannot be copied verbatim. The display uses ESP32 Preferences/NVS to preserve configuration compatibility with earlier versions and does not yet implement every C3-specific diagnostic/remote-OTA feature.
 
 - **AP:** visible open Wi-Fi `ESP-Display28`, **no Wi-Fi password**.
-- **Web PIN:** `12134` (five digits); session cookie lasts **15 minutes**, with basic bad-PIN rate limiting.
+- **Web PIN:** `(device PIN)` ; session cookie lasts **15 minutes**, with basic bad-PIN rate limiting.
 - **URL:** shown on the TFT, initially often `http://192.168.4.1`, possibly `192.168.2.<last_STA_octet>` during recovery.
 - Enter router Wi-Fi and HiveMQ credentials on the setup webpage. No private credentials are stored in this public GitHub repository.
 - **AP-only recovery (ver0.08):** when router Wi-Fi is unavailable, the display pauses STA reconnect attempts to keep the AP visible until new Wi-Fi settings are saved.
@@ -116,7 +125,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 | Filename | Function |
 | --- | --- |
-| `Display2.8-ver0.12.bin` | **MERGED full firmware**, write at **`0x000000`** |
+| `Display2.8-ver0.13.bin` | **MERGED full firmware**, write at **`0x000000`** |
 | `Display2.8.bin` | Latest **MERGED** firmware, same offset |
 | `Display2.8-app-only.bin` | App-only image for compatible existing partitions/OTA; **not** a merged image |
 | `Display2.8.ino` | Main source |
@@ -126,6 +135,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 ### Version history
 
+- **ver0.13 (09/11/2026):** Dual-root GitHub TLS certificate bundle and HTTPS preflight/retries; local OTA fallback; PIN-length hints removed.
 - **ver0.12 (09/11/2026):** Delta-based TFT drawing, unchanged-value caching, no full-screen clear on MQTT updates, limited redraw rate.
 - **ver0.11 (09/11/2026):** Local PIN-gated management website on LAN and AP; edit saved WiFi/MQTT credentials, view diagnostics, restart, clear credentials or upload app-only OTA; two-tap TFT OPEN AP.
 - **ver0.10 (09/11/2026):** AP+STA recovery, 60s saved-router retry, pause when AP client active, auto-close after stable router recovery.
@@ -136,7 +146,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 - **ver0.06 (08/11/2026):** Settings gear, NET/MQTT/DEV/SYS screens, per-device MQTT traffic diagnostics, missing-state refresh and LAN debug endpoints.
 - **ver0.05 (08/11/2026):** Correct Wi-Fi TX power initialization order and verify the limit after radio start. Confirmed by physical user test that firmware boots and BOILER MQTT temperatures appear.
 - **ver0.04 (08/11/2026):** TFT first-draw before Wi-Fi, visible setup/AP error screen and boot diagnostics.
-- **ver0.03 (08/11/2026):** CommonPlatform open AP and PIN 12134 with 15-minute cookie session, captive portal and network retries.
+- **ver0.03 (08/11/2026):** CommonPlatform open AP and PIN (device PIN) with 15-minute cookie session, captive portal and network retries.
 - **ver0.02 (08/11/2026):** Initial network and security adaptation to CommonPlatform 1.06.
 - **ver0.01 (08/11/2026):** Initial four-tab live MQTT firmware.
 
