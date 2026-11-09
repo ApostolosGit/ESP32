@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.08 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.09 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.08"
+#define FW_VERSION "ver0.09"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -696,7 +696,7 @@ void drawSetup() {
   lcd->fillScreen(UI_BG);
   txt(12,15,"ENERGY MONITOR",UI_CYAN,2);
   txt(264,19,FW_VERSION,UI_CYAN,1);
-  txt(14,53,setupMode?"SETUP WIFI + MQTT":"AP+STA RECOVERY",UI_YELLOW,2);
+  txt(14,53,setupMode?"SETUP WIFI + MQTT":"AP-ONLY RECOVERY",UI_YELLOW,2);
   txt(14,88,"Connect to WiFi AP:",UI_WHITE,1);
   txt(14,105,apSsid,UI_CYAN,2);
   txt(14,135,"WiFi OPEN  PIN: 12134",UI_YELLOW,1);
@@ -821,7 +821,7 @@ void beginPortal(bool recovery=false) {
   ++portalAttempts;
   setupMode=!recovery;
   apSsid="ESP-Display28";
-  drawStartupStage(recovery?"STABLE AP RECOVERY":"STARTING OPEN AP");
+  drawStartupStage(recovery?"AP-ONLY RECOVERY":"STARTING OPEN AP");
   // ESP32 has one radio. Stop old STA association before starting rescue AP.
   if(mqtt.connected())mqtt.disconnect();
   tls.stop();wifiCurrentlyConnected=false;
@@ -1279,7 +1279,7 @@ void maintainConnection() {
     }
     if(!portalActive && (!portalRetryAt || dueAt(portalRetryAt)) &&
        wifiSsid.length() && millis()-disconnectedSince>20000UL) {
-      beginPortal(true); // Recovery keeps STA reconnecting (AP+STA).
+      beginPortal(true); // Stable AP-only; STA retries suspended until setup saves credentials.
     }
     return;
   }
