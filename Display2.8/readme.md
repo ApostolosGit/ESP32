@@ -1,10 +1,22 @@
-# Display2.8 — Energy Monitor ver0.10
+# Display2.8 — Energy Monitor ver0.11
 
 **Hardware:** ESP32-2432S028 dual-USB, ESP32-D0WD-V3 (classic ESP32), 4 MB flash, 320×240 landscape ST7789, XPT2046 resistive touch.
 
-**Latest firmware:** `Display2.8-ver0.10.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
+**Latest firmware:** `Display2.8-ver0.11.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
 
-The GitHub Actions build has succeeded. **ver0.10 is under GitHub Actions validation; actual AP+STA behavior still requires a physical test.**
+The GitHub Actions build has succeeded. **ver0.11 is pending on-device testing. Compilation checks only verify buildability, not actual browser login, radio behavior or OTA.**
+
+## New in ver0.11 (09/11/2026): Local CommonPlatform-style web administration
+
+The Display2.8 runs a local HTTP server on **both the home LAN and the recovery AP**. If its **Wi-Fi works but MQTT credentials are wrong**, it is **not necessary to erase Wi-Fi settings, wait for router failure, or use USB**.
+
+1. Tap the permanent settings gear on the TFT, open **NET** and read **IP**. On a phone/computer using the same router Wi-Fi, browse to `http://<display-IP>/` (for example `http://192.168.1.82/` if NET shows that IP).
+2. Authenticate using the platform PIN shown on the device. A 15-minute cookie session (HttpOnly, SameSite=Strict) is required for every local maintenance action, **including over the LAN**. Wrong PIN attempts are temporarily locked out.
+3. In **Wi-Fi / MQTT configuration**, correct HiveMQ host or username; enter the new MQTT password. Existing SSID, MQTT username and broker host are prefilled after HTML escaping. **Passwords are never displayed/prepopulated**: leave a password blank to keep the stored one when not switching Wi-Fi networks. If the Wi-Fi SSID changes, a blank Wi-Fi password configures an open network.
+4. Choose **Save settings & restart**. The new values are stored in the existing `energy28` Preferences namespace, so no full erase is required. The device restarts after the HTTP response.
+5. Maintenance routes: `/` / `/setup` (admin page), `/network-debug` (JSON), `/mqtt-status` (per-device MQTT JSON), `/debug.txt` (copyable diagnostics), `/restart-esp` (GET confirmation and POST reboot), `/forget-credentials-confirm` (explicit destructive confirmation), and `/ota` (upload only `Display2.8-app-only.bin`, never merged BIN).
+6. If a browser cannot reach the LAN IP, tap **gear → NET → OPEN AP** or **gear → MQTT → OPEN AP** **twice within 8 seconds**. This intentionally opens the separate maintenance Wi-Fi `ESP-Display28`; join it and use the AP IP shown on the TFT, typically `http://192.168.4.1`. This manual AP remains until restart, while the router connection may continue.
+7. **Security boundary:** This is an adaptation of CommonPlatform web setup/restart/diagnostics, **not the complete ESP32-C3 platform** (no C3 RTC crash-trace recovery/IDE ArduinoOTA protocol equivalence). Open AP/HTTP are unencrypted; configure only in trusted surroundings. The public MQTT.app **does not display the setup PIN, AP instructions, or firmware repository help paragraph**.
 
 ## New in ver0.10 (09/11/2026): Hybrid AP+STA auto-recovery
 
@@ -92,7 +104,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 | Filename | Function |
 | --- | --- |
-| `Display2.8-ver0.10.bin` | **MERGED full firmware**, write at **`0x000000`** |
+| `Display2.8-ver0.11.bin` | **MERGED full firmware**, write at **`0x000000`** |
 | `Display2.8.bin` | Latest **MERGED** firmware, same offset |
 | `Display2.8-app-only.bin` | App-only image for compatible existing partitions/OTA; **not** a merged image |
 | `Display2.8.ino` | Main source |
@@ -102,6 +114,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 ### Version history
 
+- **ver0.11 (09/11/2026):** Local PIN-gated management website on LAN and AP; edit saved WiFi/MQTT credentials, view diagnostics, restart, clear credentials or upload app-only OTA; two-tap TFT OPEN AP.
 - **ver0.10 (09/11/2026):** AP+STA recovery, 60s saved-router retry, pause when AP client active, auto-close after stable router recovery.
 - **ver0.09 (09/11/2026):** Stable AP-only fallback with STA reconnections suspended while the AP is open, fixed AP name `ESP-Display28`, maximum 20 dBm requested TX (regulatory/hardware limited); correct on-screen AP-only label; verified matching app-only OTA file published to ESP32-OTA.bin. Compile successful, physical network and OTA testing outstanding.
 - **ver0.09 (09/11/2026):** Accurate AP-only status text; merged + OTA release verified by CI.
