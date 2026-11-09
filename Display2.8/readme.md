@@ -1,10 +1,22 @@
-# Display2.8 — Energy Monitor ver0.09
+# Display2.8 — Energy Monitor ver0.10
 
 **Hardware:** ESP32-2432S028 dual-USB, ESP32-D0WD-V3 (classic ESP32), 4 MB flash, 320×240 landscape ST7789, XPT2046 resistive touch.
 
-**Latest firmware:** `Display2.8-ver0.09.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
+**Latest firmware:** `Display2.8-ver0.10.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
 
-The GitHub Actions build has succeeded. **ver0.09 compiled and its merged BIN was published successfully. Physical validation of AP stability and remote OTA remains necessary.**
+The GitHub Actions build has succeeded. **ver0.10 is under GitHub Actions validation; actual AP+STA behavior still requires a physical test.**
+
+## New in ver0.10 (09/11/2026): Hybrid AP+STA auto-recovery
+
+- Normal operation: ESP32 connects to the configured router in **STA-only**, keeping its open `ESP-Display28` AP off.
+- If that router remains unavailable for roughly **20 seconds**, a recovery AP appears as `ESP-Display28` with **no Wi-Fi password**, browser PIN **12134**, and the AP address shown on the screen (usually `http://192.168.4.1`).
+- The recovery radio stays in **WIFI_AP_STA mode**; unlike ver0.09, it checks the **saved router every 60 seconds** with `esp_wifi_connect()`, without resetting the SoftAP.
+- **While a phone is connected to the AP, router reconnection attempts pause.** Web activity also provides a 20-second quiet period to protect settings submissions. ESP32 has one radio, so an active STA scan can nevertheless briefly disturb SoftAP beacons.
+- When router association and IP are valid for at least **15 continuous seconds**, recovery AP automatically closes only **if no AP client is connected and no recent web configuration is in progress**. Normal MQTT reconnects then resume.
+- If the old router does not return (for example, its SSID or password changed), the AP stays available until a person supplies the new Wi-Fi credentials. The manually forced `PORTAL` mode stays open until reboot.
+- The earlier **requested 20 dBm TX** behavior, four sensor tabs and MQTT.app management/OTA support are retained. Actual radio power is hardware- and regional-regulation-dependent; 20 dBm is **not** the original CommonPlatform 1.06 15 dBm ceiling.
+
+**Important:** This is a new hardware behavior. GitHub Actions compiling it does not constitute a verified test of radio visibility, reconnect timing or forced AP lifetime.
 
 ## What's new in ver0.09 (09/11/2026)
 
@@ -80,7 +92,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 | Filename | Function |
 | --- | --- |
-| `Display2.8-ver0.09.bin` | **MERGED full firmware**, write at **`0x000000`** |
+| `Display2.8-ver0.10.bin` | **MERGED full firmware**, write at **`0x000000`** |
 | `Display2.8.bin` | Latest **MERGED** firmware, same offset |
 | `Display2.8-app-only.bin` | App-only image for compatible existing partitions/OTA; **not** a merged image |
 | `Display2.8.ino` | Main source |
@@ -90,6 +102,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 ### Version history
 
+- **ver0.10 (09/11/2026):** AP+STA recovery, 60s saved-router retry, pause when AP client active, auto-close after stable router recovery.
 - **ver0.09 (09/11/2026):** Stable AP-only fallback with STA reconnections suspended while the AP is open, fixed AP name `ESP-Display28`, maximum 20 dBm requested TX (regulatory/hardware limited); correct on-screen AP-only label; verified matching app-only OTA file published to ESP32-OTA.bin. Compile successful, physical network and OTA testing outstanding.
 - **ver0.09 (09/11/2026):** Accurate AP-only status text; merged + OTA release verified by CI.
 - **ver0.08 (09/11/2026):** AP-only reliable recovery, 20 dBm requested TX, Wi-Fi name ESP-Display28; remote MQTT OTA and restart management.
