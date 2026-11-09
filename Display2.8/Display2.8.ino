@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.12 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.13 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.12"
+#define FW_VERSION "ver0.13"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -246,10 +246,10 @@ void sendPinPage(int status=200) {
     "<!doctype html><html><head><meta name='viewport' "
     "content='width=device-width,initial-scale=1'></head>"
     "<body style='background:#081522;color:#fff;font:20px Arial;padding:16px'>"
-    "<h3>Energy Monitor PIN</h3><p>Enter the 5-digit setup PIN.</p>"
+    "<h3>Energy Monitor PIN</h3><p>Enter your device PIN.</p>"
     "<form method='post' action='/ap-login'>"
     "<input name='pin' type='password' inputmode='numeric' "
-    "pattern='[0-9]{5}' minlength='5' maxlength='5' required autofocus>"
+    "autocomplete='off' required autofocus>"
     "<button type='submit'>Open</button></form></body></html>");
 }
 bool requireApWebPin() {
@@ -799,7 +799,7 @@ void drawSetup() {
   txt(14,53,setupMode?"SETUP WIFI + MQTT":"AP+STA RECOVERY",UI_YELLOW,2);
   txt(14,88,"Connect to WiFi AP:",UI_WHITE,1);
   txt(14,105,apSsid,UI_CYAN,2);
-  txt(14,135,"WiFi OPEN  PIN: 12134",UI_YELLOW,1);
+  txt(14,135,"WiFi OPEN / WEB PIN",UI_YELLOW,1);
   txt(14,166,"Open browser:",UI_WHITE,1);
   txt(14,184,"http://"+WiFi.softAPIP().toString(),UI_CYAN,2);
   txt(14,217,"No credentials on GitHub",UI_MUTED,1);
@@ -1291,17 +1291,44 @@ void performDisplayOta() {
   adminReply("ota_https_v2",true,"starting",0);
   WiFiClientSecure otaTls;
   otaTls.setCACert(GITHUB_ROOT_CA);
-  otaTls.setTimeout(12000);
+  otaTls.setTimeout(16000);
   HTTPClient http;
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  http.setConnectTimeout(15000);
+  http.setTimeout(16000);
   bool success=false;
   String error="unknown";
   do {
-    if(!http.begin(otaTls,displayOtaJob.url)) {
-      error="https_start_failed";break;
+    const char *otaHost="raw.githubusercontent.com";
+    IPAddress resolved;
+    if(WiFi.hostByName(otaHost,resolved)!=1) {
+      error="github_dns_failed";
+      Serial.println("[OTA] GitHub DNS failed; check router DNS");
+      break;
     }
-    int code=http.GET();
-    if(code!=HTTP_CODE_OK){error="https_http_"+String(code);break;}
+    Serial.printf("[OTA] GitHub DNS=%s free heap=%lu largest=%lu\n",
+       resolved.toString().c_str(),(unsigned long)ESP.getFreeHeap(),
+       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT));
+    int code=0;
+    for(uint8_t attempt=1;attempt<=3;attempt++) {
+      // Retry only before flashing starts. HTTPS is validated against the
+      // DigiCert + ISRG X1 root CA bundle; never use setInsecure().
+      if(!http.begin(otaTls,displayOtaJob.url)) {
+        error="https_start_failed";break;
+      }
+      code=http.GET();
+      if(code==HTTP_CODE_OK)break;
+      char tlsDetails[128]={0};
+      int tlsError=otaTls.lastError(tlsDetails,sizeof(tlsDetails));
+      Serial.printf("[OTA] GitHub HTTPS attempt %u/3 HTTP=%d (%s) TLS=%d (%s) heap=%lu\n",
+        (unsigned)attempt,code,http.errorToString(code).c_str(),
+        tlsError,tlsDetails,(unsigned long)ESP.getFreeHeap());
+      error="https_http_"+String(code);
+      http.end();otaTls.stop();
+      if(code>0 || attempt>=3 || WiFi.status()!=WL_CONNECTED)break;
+      delay(450UL*attempt);
+    }
+    if(code!=HTTP_CODE_OK)break;
     int announced=http.getSize();
     if(announced<=0 || (size_t)announced!=displayOtaJob.size) {
       error="size_mismatch_or_chunked";break;
