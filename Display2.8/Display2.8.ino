@@ -30,7 +30,9 @@
 #include <Update.h>
 #include <esp_heap_caps.h>
 #include <esp_wifi.h> // Native API: TX power limit after radio start
+#include <HTTPClient.h> // HTTPS OTA file streaming from approved GitHub repo
 #include "TrustedCA.h"
+#include "GithubCA.h"
 
 Arduino_DataBus *db = new Arduino_ESP32SPI(2, 15, 14, 13, 12);
 Arduino_GFX *lcd = new Arduino_ST7789(db, GFX_NOT_DEFINED, 1, true, 240, 320);
@@ -75,6 +77,9 @@ bool mqttSubs[3]={false,false,false};
 uint32_t lastTouchRawX=0,lastTouchRawY=0;
 uint32_t nextProbeAt[4]={0,0,0,0};
 uint32_t nextSubRetryAt=0;
+uint32_t nextDisplayHealthAt=0, restartAt=0;
+bool displayStateRequested=false, displayOtaBusy=false;
+struct DisplayOtaJob {bool pending=false;size_t size=0;String md5,url;} displayOtaJob;
 bool live(int pg); // Forward declaration: settings JSON is above rendering code
 void requestAll(); // Settings UI and MQTT callback can schedule polling
 
@@ -157,6 +162,7 @@ String jsonStatus() {
   j["ap_active"]=portalActive;j["mqtt_connected"]=mqtt.connected();
   j["ap_radio_restarts"]=portalRadioRestarts;
   j["ap_ssid"]=apSsid;
+  j["display_ota_busy"]=displayOtaBusy;
   j["ap_ip"]=portalActive?WiFi.softAPIP().toString():"";
   j["ap_pin_session_sec_left"]=portalActive && apWebSessionToken[0] &&
     millis()-apWebSessionStartedMs < AP_WEB_SESSION_MS ?
@@ -937,6 +943,196 @@ int typeByDoc(JsonDocument &doc) {
   if(doc.containsKey("power")) return 0;
   return -1;
 }
+// CommonPlatform-compatible device-management topics. The display is separate
+// from DDS/JSY/VENT/BOILER and never acts as an EnergyMeter.
+String displayTopic(const char* suffix) {
+  return "home/energy/"+deviceId()+"/"+suffix;
+}
+void publishDisplaySnapshot(bool withState=true) {
+  if(!mqtt.connected())return;
+  StaticJsonDocument<1024> doc;
+  doc["meter"]="DISPLAY28";
+  doc["device_type"]="DISPLAY28";
+  doc["application"]="display28";
+  doc["driver"]="ST7789-XPT2046";
+  doc["profile"]=OTA_PROFILE_ID;
+  doc["ota_protocol"]=2;
+  doc["platform_version"]="1.06";
+  doc["firmware"]=FW_VERSION;
+  doc["meter_ok"]=true;
+  doc["read_attempted"]=true;
+  doc["has_sample"]=true;
+  doc["rssi"]=(WiFi.status()==WL_CONNECTED)?WiFi.RSSI():-127;
+  doc["sta_ip"]=(WiFi.status()==WL_CONNECTED)?WiFi.localIP().toString():"";
+  doc["tx_dbm_tenths"]=txPowerVerified?TX_TENTHS[txLevel]:0;
+  doc["ap_active"]=portalActive;
+  doc["uptime_sec"]=millis()/1000UL;
+  doc["heap_free"]=ESP.getFreeHeap();
+  doc["mqtt_packets"]=mqttPackets;
+  doc["ota_busy"]=displayOtaBusy;
+  char json[1024];size_t n=serializeJson(doc,json,sizeof(json));
+  if(!n)return;
+  const String h=displayTopic("health");
+  mqtt.publish(h.c_str(),json,true);
+  if(withState) {
+    const String t=displayTopic("state");
+    mqtt.publish(t.c_str(),json,false);
+  }
+  nextDisplayHealthAt=millis()+30000UL;
+}
+void adminReply(const char *cmd,bool ok,const String &status,
+                int progress=-1) {
+  if(!mqtt.connected())return;
+  StaticJsonDocument<448> doc;
+  doc["cmd"]=cmd;doc["ok"]=ok;
+  doc["state"]=status;
+  doc["firmware"]=FW_VERSION;
+  doc["profile"]=OTA_PROFILE_ID;
+  if(progress>=0)doc["progress"]=progress;
+  char out[448];serializeJson(doc,out,sizeof(out));
+  String t=displayTopic("admin/response");
+  mqtt.publish(t.c_str(),out,false);
+}
+bool isAsciiMd5(const String &m) {
+  if(m.length()!=32)return false;
+  for(size_t i=0;i<m.length();i++) {
+    char c=m[i];
+    if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||
+         (c>='A'&&c<='F')))return false;
+  }
+  return true;
+}
+bool approvedDisplayOtaUrl(const String &url) {
+  const String prefix=
+    "https://raw.githubusercontent.com/ApostolosGit/ESP32-OTA.bin/main/Display2.8-ver0.";
+  const String suffix="-app-only.bin";
+  if(!url.startsWith(prefix)||!url.endsWith(suffix))return false;
+  String n=url.substring(prefix.length(),url.length()-suffix.length());
+  if(n.isEmpty()||n.length()>3)return false;
+  for(size_t i=0;i<n.length();i++)if(!isDigit(n[i]))return false;
+  // Reject reinstall/downgrade; version is enforced again by Update's MD5.
+  return n.toInt()>7;
+}
+void handleDisplayAdmin(const String &command) {
+  if(command=="restart_esp|12134") {
+    if(displayOtaBusy||displayOtaJob.pending) {
+      adminReply("restart_esp",false,"busy");return;
+    }
+    adminReply("restart_esp",true,"restarting");
+    restartAt=millis()+1200UL;
+    return;
+  }
+  if(command.startsWith("ota_https_v2|")) {
+    if(displayOtaBusy||displayOtaJob.pending) {
+      adminReply("ota_https_v2",false,"busy");return;
+    }
+    // Strict allowlist + independent profile + PIN, no arbitrary URL commands.
+    String fields[6];int start=0;
+    for(int k=0;k<5;k++) {
+      int sep=command.indexOf('|',start);
+      if(sep<0){adminReply("ota_https_v2",false,"malformed");return;}
+      fields[k]=command.substring(start,sep);start=sep+1;
+    }
+    fields[5]=command.substring(start);
+    size_t bytes=(size_t)fields[1].toInt();
+    if(fields[0]!="ota_https_v2" || !bytes || bytes>1500000 ||
+       !isAsciiMd5(fields[2]) ||
+       !approvedDisplayOtaUrl(fields[3]) ||
+       fields[4]!=OTA_PROFILE_ID || fields[5]!="12134") {
+      adminReply("ota_https_v2",false,"profile_or_manifest_rejected");return;
+    }
+    if(WiFi.status()!=WL_CONNECTED || time(nullptr)<1600000000) {
+      adminReply("ota_https_v2",false,"network_or_ntp_unavailable");return;
+    }
+    displayOtaJob.size=bytes;
+    displayOtaJob.md5=fields[2];
+    displayOtaJob.url=fields[3];
+    displayOtaJob.pending=true;
+    adminReply("ota_https_v2",true,"accepted");
+    Serial.printf("[OTA] accepted %u bytes from approved GitHub repo\n",(unsigned)bytes);
+    return;
+  }
+  adminReply("unknown",false,"unsupported_command");
+}
+void performDisplayOta() {
+  if(!displayOtaJob.pending || displayOtaBusy)return;
+  displayOtaBusy=true;
+  displayOtaJob.pending=false;
+  if(!mqtt.connected() || WiFi.status()!=WL_CONNECTED) {
+    adminReply("ota_https_v2",false,"network_disconnected");
+    displayOtaBusy=false;return;
+  }
+  drawStartupStage("OTA UPDATING");
+  adminReply("ota_https_v2",true,"starting",0);
+  WiFiClientSecure otaTls;
+  otaTls.setCACert(GITHUB_ROOT_CA);
+  otaTls.setTimeout(12000);
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  bool success=false;
+  String error="unknown";
+  do {
+    if(!http.begin(otaTls,displayOtaJob.url)) {
+      error="https_start_failed";break;
+    }
+    int code=http.GET();
+    if(code!=HTTP_CODE_OK){error="https_http_"+String(code);break;}
+    int announced=http.getSize();
+    if(announced<=0 || (size_t)announced!=displayOtaJob.size) {
+      error="size_mismatch_or_chunked";break;
+    }
+    if(!Update.begin(displayOtaJob.size,U_FLASH)) {
+      error="update_partition_unavailable";break;
+    }
+    if(!Update.setMD5(displayOtaJob.md5.c_str())) {
+      error="md5_configuration_failed";Update.abort();break;
+    }
+    uint8_t buffer[1024];
+    WiFiClient *input=http.getStreamPtr();
+    size_t done=0;
+    uint32_t started=millis(),lastData=started,lastProgress=started;
+    bool streamError=false;
+    while(done<displayOtaJob.size && millis()-started<240000UL) {
+      size_t available=input->available();
+      if(!available) {
+        if(!http.connected() && millis()-lastData>1000UL)break;
+        if(millis()-lastData>12000UL)break;
+        mqtt.loop();delay(5);continue;
+      }
+      size_t take=min((size_t)sizeof(buffer),min(available,displayOtaJob.size-done));
+      size_t got=input->readBytes(buffer,take);
+      if(!got)continue;
+      if(Update.write(buffer,got)!=got){streamError=true;break;}
+      done+=got;lastData=millis();
+      if(millis()-lastProgress>4000UL) {
+        lastProgress=millis();
+        adminReply("ota_https_v2",true,"writing",(int)(done*100/displayOtaJob.size));
+        mqtt.loop();
+      }
+      delay(1);
+    }
+    if(streamError || done!=displayOtaJob.size) {
+      error="download_or_write_incomplete";
+      Update.abort();break;
+    }
+    if(!Update.end()) {
+      error="md5_or_flash_validation_failed";break;
+    }
+    success=true;
+  } while(false);
+  http.end();otaTls.stop();
+  if(success) {
+    adminReply("ota_https_v2",true,"rebooting",100);
+    Serial.println("[OTA] verified update complete, rebooting");
+    delay(800);ESP.restart();
+    return;
+  }
+  adminReply("ota_https_v2",false,error);
+  Serial.printf("[OTA] failed %s, Update error=%d\n",error.c_str(),Update.getError());
+  displayOtaBusy=false;
+  if(portalActive)drawSetup();else render();
+}
+
 // Decode every subscribed topic. Every device has its own counters and ages,
 // making it possible to distinguish missing traffic from stale/invalid JSON.
 void mqttMessage(char *topic,byte *payload,unsigned int len) {
@@ -948,6 +1144,20 @@ void mqttMessage(char *topic,byte *payload,unsigned int len) {
   int div=rest.indexOf('/');
   if(div<1) {mqttUnknown++;snprintf(lastUnknownTopic,sizeof(lastUnknownTopic),"%s",topic);return;}
   String id=rest.substring(0,div), suffix=rest.substring(div+1);
+  if(id==deviceId()) {
+    if(suffix=="admin/request") {
+      if(len>380){adminReply("unknown",false,"command_too_large");return;}
+      String command;
+      command.reserve(len+1);
+      for(unsigned i=0;i<len;i++)command+=(char)payload[i];
+      handleDisplayAdmin(command);
+    } else if(suffix=="request") {
+      String command;
+      for(unsigned i=0;i<len&&i<20;i++)command+=(char)payload[i];
+      if(command=="update")displayStateRequested=true;
+    }
+    return;
+  }
   int type=typeById(id);
   if(suffix=="state" || suffix=="health") {
     incomingState.clear();
@@ -1139,10 +1349,19 @@ void maintainConnection() {
   mqttReconnects++;
   const String id=deviceId();
   Serial.printf("[MQTT] TLS connect attempt %lu\n",(unsigned long)mqttReconnects);
-  if(mqtt.connect(id.c_str(),mqttUser.c_str(),mqttPass.c_str())) {
+  const String will=displayTopic("status");
+  if(mqtt.connect(id.c_str(),mqttUser.c_str(),mqttPass.c_str(),
+                  will.c_str(),1,true,"offline")) {
     mqttSubs[0]=mqtt.subscribe("home/energy/+/state");
     mqttSubs[1]=mqtt.subscribe("home/energy/+/status");
     mqttSubs[2]=mqtt.subscribe("home/energy/+/health");
+    const String ownAdmin=displayTopic("admin/request");
+    const String ownRequest=displayTopic("request");
+    bool adminSub=mqtt.subscribe(ownAdmin.c_str());
+    bool stateRequestSub=mqtt.subscribe(ownRequest.c_str());
+    mqtt.publish(will.c_str(),"online",true);
+    publishDisplaySnapshot(true);
+    Serial.printf("[MQTT] display admin=%d request=%d\n",adminSub,stateRequestSub);
     Serial.printf("[MQTT] connected SUBS state=%d status=%d health=%d\n",
                   mqttSubs[0],mqttSubs[1],mqttSubs[2]);
     mqttEverConnected=true;
@@ -1289,7 +1508,14 @@ void loop() {
   maintainConnection();
   handleTouch();
   serviceDeviceProbes();
-  if(mqtt.connected() && millis()-lastPoll>60000UL)requestAll();
+  if(mqtt.connected()) {
+    if(displayStateRequested || dueAt(nextDisplayHealthAt)) {
+      displayStateRequested=false;publishDisplaySnapshot(true);
+    }
+    if(millis()-lastPoll>60000UL)requestAll();
+    if(displayOtaJob.pending)performDisplayOta();
+  }
+  if(restartAt && dueAt(restartAt)){delay(100);ESP.restart();}
   if(millis()-lastDraw>10000UL && !portalActive)render();
   if(millis()-lastHealthLine>60000UL) {
     lastHealthLine=millis();Serial.println(jsonStatus());
