@@ -1,15 +1,15 @@
 /*
-  Energy Monitor ver0.06 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.07 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
-  AP setup: OPEN SSID ESP28-SETUP-XXXX, web PIN 12134, 15 min session.
-  AP URL is shown on-screen (default http://192.168.2.88).
+  AP setup: OPEN SSID ESP-Display28, web PIN 12134, 15 min session.
+  AP URL is shown on-screen (normally http://192.168.4.1).
   Sensitive Wi-Fi/MQTT settings stay in on-device Preferences, never in source.
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.06"
+#define FW_VERSION "ver0.07"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -90,6 +90,7 @@ char apWebSessionToken[33] = {};
 uint32_t apWebSessionStartedMs=0, apPinLockedUntil=0;
 uint8_t apPinFailures=0;
 uint32_t portalStartMs=0, portalHealthMs=0, portalRetryAt=0, portalAttempts=0, portalFailures=0;
+uint32_t portalRadioRenewedAt=0,portalRadioRestarts=0;
 bool wifiEverConnected=false, mqttEverConnected=false, otaImageComplete=false;
 bool wifiCurrentlyConnected=false;
 uint32_t wifiFailures=0, mqttFailures=0, wifiReconnects=0, mqttReconnects=0;
@@ -135,7 +136,7 @@ bool setTxLevel(uint8_t level,const char *reason) {
   return true;
 }
 void retuneWifi() {
-  if(WiFi.status()!=WL_CONNECTED || millis()-lastTxTune<60000UL)return;
+  if(WiFi.status()!=WL_CONNECTED || portalActive || millis()-lastTxTune<60000UL)return;
   int rssi=WiFi.RSSI();
   uint8_t target=(rssi>=-66)?0:(rssi>=-74)?1:(rssi>=-81)?2:3;
   if(target!=txLevel)setTxLevel(target,"RSSI");
@@ -154,6 +155,8 @@ String jsonStatus() {
   j["tx_verified"]=txPowerVerified;
   j["tx_last_error"]=lastTxError;
   j["ap_active"]=portalActive;j["mqtt_connected"]=mqtt.connected();
+  j["ap_radio_restarts"]=portalRadioRestarts;
+  j["ap_ssid"]=apSsid;
   j["ap_ip"]=portalActive?WiFi.softAPIP().toString():"";
   j["ap_pin_session_sec_left"]=portalActive && apWebSessionToken[0] &&
     millis()-apWebSessionStartedMs < AP_WEB_SESSION_MS ?
@@ -243,10 +246,12 @@ void handleApWebLogin() {
   webServer.sendHeader("Location","/",true);
   webServer.send(303,"text/plain","");
 }
-uint8_t portalOctet() {
-  if(WiFi.status()==WL_CONNECTED && WiFi.localIP()[3]>=2 &&
-     WiFi.localIP()[3]<=254)return WiFi.localIP()[3];
-  return 88; // No pre-reserved static IP for this board.
+IPAddress portalIp() {
+  // Separate AP and STA subnets. Never reuse the home router IP range.
+  if(WiFi.status()==WL_CONNECTED && WiFi.localIP()[0]==192 &&
+     WiFi.localIP()[1]==168 && WiFi.localIP()[2]==4)
+    return IPAddress(192,168,8,1);
+  return IPAddress(192,168,4,1);
 }
 // Detailed non-secret diagnostic data for the settings web endpoints.
 String mqttDebugJson() {
@@ -595,7 +600,7 @@ void settingsPage() {
     txt(117,190,String(wifiReconnects),UI_WHITE,1);
     txt(168,190,"FAIL:",UI_MUTED,1);
     txt(218,190,String(wifiFailures),UI_RED,1);
-    txt(11,206,"WEB: /network-debug",UI_CYAN,1);
+    txt(11,206,portalActive?"AP: ESP-Display28":"WEB: /network-debug",UI_CYAN,1);
   } else if(settingsPane==1) {
     txt(8,67,"MQTT DEBUG",UI_CYAN,2);
     card(4,87,312,137);
@@ -808,7 +813,7 @@ void beginPortal(bool recovery=false) {
   if(portalActive)return;
   ++portalAttempts;
   setupMode=!recovery;
-  apSsid="ESP28-SETUP-"+String((uint16_t)ESP.getEfuseMac(),HEX);
+  apSsid="ESP-Display28";
   drawStartupStage(recovery?"AP+STA RECOVERY":"STARTING OPEN AP");
   if(!WiFi.mode(recovery?WIFI_AP_STA:WIFI_AP)) {
     portalFailures++;portalRetryAt=millis()+30000;
@@ -817,8 +822,7 @@ void beginPortal(bool recovery=false) {
   }
   // Start the radio interface FIRST, then set and read back its TX ceiling.
   // In ver0.04 the TX call preceded softAP() and failed with NOT_STARTED.
-  uint8_t octet=portalOctet();
-  IPAddress ip(192,168,2,octet);
+  IPAddress ip=portalIp();
   if(!WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) ||
      !WiFi.softAP(apSsid.c_str(),nullptr,1,0,4)) {
     portalFailures++;portalRetryAt=millis()+30000;
@@ -826,7 +830,7 @@ void beginPortal(bool recovery=false) {
     drawStartupStage("AP start failed",true);return;
   }
   txPowerVerified=false;
-  if(!setTxLevel(0,"AP already started")) {
+  if(!setTxLevel(3,"AP started - recovery visibility at 15 dBm")) {
     // Fail closed: do not leave an open AP transmitting at an unknown limit.
     WiFi.softAPdisconnect(true);
     if(recovery && wifiSsid.length())WiFi.mode(WIFI_STA);
@@ -836,6 +840,7 @@ void beginPortal(bool recovery=false) {
   }
   portalActive=true;
   portalStartMs=millis();
+  portalRadioRenewedAt=portalStartMs;
   portalHealthMs=portalStartMs;
   portalRetryAt=0;
   resetApWebSession();
@@ -852,21 +857,52 @@ void servicePortal() {
     if(apDnsRunning)portalDns.processNextRequest();
     if(millis()-portalHealthMs>=3000) {
       portalHealthMs=millis();
-      // Avoid repeatedly turning the radio off on transient readback failures.
-      if(millis()-portalStartMs>5000 &&
-         WiFi.getMode()!=WIFI_AP && WiFi.getMode()!=WIFI_AP_STA) {
-        portalActive=false;
+      const wifi_mode_t m=WiFi.getMode();
+      const bool modeOk=(m==WIFI_AP || m==WIFI_AP_STA);
+      wifi_config_t apCfg={};
+      const bool configOk=(esp_wifi_get_config(WIFI_IF_AP,&apCfg)==ESP_OK) &&
+                          String((const char*)apCfg.ap.ssid)==apSsid;
+      if(millis()-portalStartMs>5000 && (!modeOk || !configOk)) {
         if(apDnsRunning)portalDns.stop();
         apDnsRunning=false;
-        resetApWebSession();
-        portalFailures++;
-        portalRetryAt=millis()+30000;
-        Serial.println("[AP] interface missing, retry scheduled");
+        portalActive=false;
+        resetApWebSession();portalFailures++;
+        portalRetryAt=millis()+1500;
+        Serial.printf("[AP] LOST mode=%d config=%d; restarting\n",(int)m,configOk);
+        drawStartupStage("AP radio restart",true);
+        return;
+      }
+      // When searching for a new router, STA scans/associations can reconfigure
+      // the shared AP channel. If no phone connects, periodically re-beacon.
+      if(WiFi.status()!=WL_CONNECTED && WiFi.softAPgetStationNum()==0 &&
+         millis()-portalRadioRenewedAt>60000UL) {
+        portalRadioRenewedAt=millis();
+        portalRadioRestarts++;
+        Serial.printf("[AP] Reannounce %s (count %lu)\n",
+                      apSsid.c_str(),(unsigned long)portalRadioRestarts);
+        if(apDnsRunning)portalDns.stop();
+        apDnsRunning=false;
+        WiFi.softAPdisconnect(false);
+        delay(80);
+        const IPAddress ip=portalIp();
+        bool ok=WiFi.softAPConfig(ip,ip,IPAddress(255,255,255,0)) &&
+                WiFi.softAP(apSsid.c_str(),nullptr,1,0,4) &&
+                setTxLevel(3,"AP reannounce 15 dBm");
+        if(ok) {
+          portalDns.start(53,"*",WiFi.softAPIP());
+          apDnsRunning=true;
+          if(!settingsOpen)drawSetup();
+        } else {
+          portalActive=false;portalFailures++;
+          portalRetryAt=millis()+1500;
+          drawStartupStage("AP restart failed",true);
+        }
       }
     }
   } else if(portalRetryAt && dueAt(portalRetryAt)) {
     portalRetryAt=0;
-    if(wifiSsid.isEmpty() || portalForced || (disconnectedSince && millis()-disconnectedSince>=20000))
+    if(wifiSsid.isEmpty() || portalForced ||
+       (disconnectedSince && millis()-disconnectedSince>=20000))
       beginPortal(!wifiSsid.isEmpty());
   }
 }
@@ -1031,10 +1067,10 @@ void startStation() {
   }
   // The radio is started by WiFi.begin; TX setting is valid only afterwards.
   // Escalate on subsequent connection attempts, capped at 15 dBm.
-  uint8_t target=wifiRetryIdx>3?3:wifiRetryIdx;
+  uint8_t target=3; // Reliable router acquisition at 15 dBm (especially after router change).
   WiFi.begin(wifiSsid.c_str(),wifiPass.c_str());
   txPowerVerified=false;
-  if(!setTxLevel(target,"STA started")) {
+  if(!setTxLevel(target,portalActive?"AP+STA stay visible":"STA started")) {
     WiFi.disconnect(false,false); // Stop association with an unverified TX cap.
     Serial.println("[WiFi] TX cap failed; STA attempt stopped");
     nextWifiAttempt=millis()+10000;wifiFailures++;return;
