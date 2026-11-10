@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.13 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.14 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.13"
+#define FW_VERSION "ver0.14"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -934,9 +934,10 @@ void registerWebRoutes() {
     settings.putFloat("price",(price>0.0f && price<10.0f)?price:0.25f);
     settings.end();
     webServer.sendHeader("Cache-Control","no-store");
+    restartAt=millis()+1700UL;
+    Serial.println("[WEB] Saved AP/LAN credentials to NVS; scheduled reboot");
     webServer.send(200,"text/html; charset=utf-8",
       "<h2>Saved. Device restarting.</h2><p>Connect to the configured router again.</p>");
-    restartAt=millis()+1400UL;
   });
   webServer.on("/restart-esp",HTTP_GET,[](){
     if(!requireApWebPin())return;
@@ -1777,6 +1778,16 @@ void loop() {
     }
   }
   if(routesReady)webServer.handleClient();
+  // CRITICAL: scheduled /save, /restart-esp and /forget-credentials
+  // must execute even when credentials are empty. In ver0.13 the
+  // no-credentials branch returned BEFORE the restart timer was checked.
+  if(restartAt && dueAt(restartAt)) {
+    Serial.println("[WEB] Saved configuration: restarting ESP32");
+    Serial.flush();
+    delay(60);
+    ESP.restart();
+    return;
+  }
   servicePortal();
   if(wifiSsid.isEmpty() || mqttUser.isEmpty() || mqttPass.isEmpty()) {
     if(!portalActive && !portalRetryAt && dueAt(nextWifiAttempt)) {
@@ -1796,7 +1807,6 @@ void loop() {
     if(millis()-lastPoll>60000UL)requestAll();
     if(displayOtaJob.pending)performDisplayOta();
   }
-  if(restartAt && dueAt(restartAt)){delay(100);ESP.restart();}
   if((!portalActive || settingsOpen) &&
      ((uiRefreshPending && millis()-lastDraw>=UI_REFRESH_MIN_MS) ||
       millis()-lastDraw>10000UL))render();
