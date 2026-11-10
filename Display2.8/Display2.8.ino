@@ -92,6 +92,35 @@ uint32_t nextSubRetryAt=0;
 uint32_t nextDisplayHealthAt=0, restartAt=0;
 bool displayStateRequested=false, displayOtaBusy=false;
 struct DisplayOtaJob {bool pending=false;size_t size=0;String md5,url;} displayOtaJob;
+
+// Existing source devices publish their own history via MQTT:
+// Energy: admin/history with history_get|token|0|offset pages.
+// VENT: vent/history; BOILER: boiler/history, current + previous 24h,
+// eight quarter-hour samples per packet. No synthetic sensor history.
+constexpr uint16_t CHART_ENERGY_CAPACITY=256;
+struct EnergyHistoryPoint {
+  uint32_t epoch=0,generation=0;
+  uint64_t importWh=0,exportWh=0;
+};
+EnergyHistoryPoint chartEnergy[CHART_ENERGY_CAPACITY];
+uint16_t chartEnergyCount=0;
+float chartTemperatures[4][192]; // 48 hours, four channels, 15-minute steps.
+bool chartTempBlocks[2][12]={{false}}; // current/previous: 12 x 8 points.
+bool chartSubs[3]={false,false,false};
+bool chartOpen=false,chartLoading=false,chartComplete=false,chartDirty=false;
+uint8_t chartPage=0,chartPhase=0;
+uint32_t chartToken=0,chartAnchorEpoch=0,chartRequestAt=0,chartLastDataAt=0;
+uint32_t chartRequests=0,chartFrames=0;
+long chartOffset=0,chartRecentFirst=-1;
+uint16_t chartPageRows=0;
+bool chartEnergyBegun=false;
+char chartError[48]={0};
+void startHistoryChart(uint8_t page);
+void handleChartMessage(uint8_t deviceType,const String &suffix,
+                        const byte *payload,unsigned int length);
+void drawHistoryChart(bool full);
+void serviceHistoryChart();
+
 bool live(int pg); // Forward declaration: settings JSON is above rendering code
 void requestAll(); // Settings UI and MQTT callback can schedule polling
 
