@@ -1,5 +1,5 @@
 /*
-  Energy Monitor ver0.14 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
+  Energy Monitor ver0.15 - 2.8" CYD ESP32-2432S028 (dual USB) / 320x240 landscape.
   DDS: Metritis DEI Artemida; JSY: Nestou 5A; Ventilation; Boiler.
   Live read-only dashboard mirroring the MQTT.app state schema.
   Factory backup before flashing. Values are NEVER hard-coded samples.
@@ -9,7 +9,7 @@
   MQTT TLS 8883, trusted ISRG Root X1, no control commands; refresh requests only.
   Libraries: Arduino_GFX 1.4.9, XPT2046_Touchscreen, PubSubClient, ArduinoJson 6.
 */
-#define FW_VERSION "ver0.14"
+#define FW_VERSION "ver0.15"
 #define COMPAT_PLATFORM "CommonPlatform-1.06 / ESP32 classic adapter"
 #define DEVICE_ID_PREFIX "display28-"
 #define OTA_PROFILE_ID "esp32-display28-st7789"
@@ -82,6 +82,20 @@ SourceDebug sourceDebug[4];
 bool settingsOpen=false;
 uint32_t setupConfirmUntil=0;
 uint8_t settingsPane=0;
+// Network manager: 1=WiFi settings, 2=choose router, 3=masked keyboard.
+// Wi-Fi passwords never appear as plaintext on the TFT, serial or MQTT.
+uint8_t wifiUiMode=0,wifiListOffset=0,wifiFoundCount=0;
+String wifiFoundSsid[18],wifiSelectedSsid,wifiDraftPassword;
+int32_t wifiFoundDbm[18]={};
+bool wifiFoundSecured[18]={};
+bool wifiScanBusy=false,wifiScanQueued=false;
+uint32_t wifiScanAt=0,wifiUiConfirmUntil=0;
+bool wifiPasswordChanged=false,wifiHasSavedPassword=false,wifiUppercase=false,wifiSymbols=false;
+char wifiUiMessage[52]={};
+void openWifiManager();
+void handleWifiManagerTouch(int x,int y);
+void drawWifiManager(bool full);
+void serviceWifiManager();
 uint32_t mqttPackets=0,mqttJsonErrors=0,mqttUnknown=0,mqttRequestTotal=0;
 uint32_t lastMqttPacketAt=0;
 char lastMqttTopic[100]={0},lastMqttError[55]={0},lastUnknownTopic[100]={0};
@@ -222,6 +236,9 @@ String jsonStatus() {
     WiFi.status()!=WL_CONNECTED && !portalForced && nextRecoveryStaAttempt?
       (dueAt(nextRecoveryStaAttempt)?0:(nextRecoveryStaAttempt-millis())/1000UL):-1;
   j["display_ota_busy"]=displayOtaBusy;
+  j["wifi_ui_mode"]=wifiUiMode;
+  j["wifi_scan_busy"]=wifiScanBusy;
+  j["wifi_scan_found"]=wifiFoundCount;
   j["ap_ip"]=portalActive?WiFi.softAPIP().toString():"";
   j["ap_pin_session_sec_left"]=portalActive && apWebSessionToken[0] &&
     millis()-apWebSessionStartedMs < AP_WEB_SESSION_MS ?
