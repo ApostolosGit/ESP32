@@ -96,6 +96,9 @@ void openWifiManager();
 void handleWifiManagerTouch(int x,int y);
 void drawWifiManager(bool full);
 void serviceWifiManager();
+void rememberRouterCredentials(const String &ssid,const String &password);
+bool findRouterCredentials(const String &ssid,String &password);
+void clearRememberedRouters();
 uint32_t mqttPackets=0,mqttJsonErrors=0,mqttUnknown=0,mqttRequestTotal=0;
 uint32_t lastMqttPacketAt=0;
 char lastMqttTopic[100]={0},lastMqttError[55]={0},lastUnknownTopic[100]={0};
@@ -1337,6 +1340,7 @@ void registerWebRoutes() {
     float price=webServer.arg("price").toFloat();
     settings.putFloat("price",(price>0.0f && price<10.0f)?price:0.25f);
     settings.end();
+    rememberRouterCredentials(ssid,newWifiPass);
     webServer.sendHeader("Cache-Control","no-store");
     restartAt=millis()+1700UL;
     Serial.println("[WEB] Saved AP/LAN credentials to NVS; scheduled reboot");
@@ -1378,6 +1382,7 @@ void registerWebRoutes() {
       webServer.send(409,"text/plain","Credentials erase not confirmed");return;
     }
     settings.begin("energy28",false);settings.clear();settings.end();
+    clearRememberedRouters();
     webServer.send(200,"text/plain","Only this device's saved credentials cleared; restarting");
     restartAt=millis()+1400UL;
   });
@@ -1893,6 +1898,49 @@ void mqttMessage(char *topic,byte *payload,unsigned int len) {
      (!settingsOpen && !portalActive && type==(int)currentPage))
     uiRefreshPending=true; // Do not draw inside the MQTT network callback.
 }
+// Last four intentionally configured routers; no password shown in the UI.
+bool findRouterCredentials(const String &ssid,String &password) {
+  password="";
+  if(ssid.isEmpty())return false;
+  if(ssid==wifiSsid && !wifiPass.isEmpty()) {
+    password=wifiPass;return true;
+  }
+  if(!settings.begin("wifi28",true))return false;
+  bool found=false;
+  for(int i=0;i<4;i++) {
+    const String keyS="s"+String(i),keyP="p"+String(i);
+    if(settings.getString(keyS.c_str(),"")==ssid) {
+      password=settings.getString(keyP.c_str(),"");
+      found=true;break;
+    }
+  }
+  settings.end();return found;
+}
+void rememberRouterCredentials(const String &ssid,const String &password) {
+  if(ssid.isEmpty()||ssid.length()>32||password.length()>64)return;
+  if(!settings.begin("wifi28",false))return;
+  int slot=-1;
+  for(int i=0;i<4;i++) {
+    if(settings.getString(("s"+String(i)).c_str(),"")==ssid) {
+      slot=i;break;
+    }
+  }
+  if(slot>=0) {
+    if(settings.getString(("p"+String(slot)).c_str(),"")!=password)
+      settings.putString(("p"+String(slot)).c_str(),password);
+  } else {
+    slot=(int)(settings.getUChar("slot",0)%4);
+    settings.putString(("s"+String(slot)).c_str(),ssid);
+    settings.putString(("p"+String(slot)).c_str(),password);
+    settings.putUChar("slot",(uint8_t)((slot+1)%4));
+  }
+  settings.end();
+}
+void clearRememberedRouters() {
+  if(settings.begin("wifi28",false)) {
+    settings.clear();settings.end();
+  }
+}
 void readConfig() {
   settings.begin("energy28",true); // Keep backwards compatibility with ver0.01 NVS.
   wifiSsid=settings.getString("ssid","");
@@ -1903,6 +1951,7 @@ void readConfig() {
   euroPerKwh=settings.getFloat("price",0.25f);
   settings.end();
   if(broker.isEmpty())broker=BROKER_DEFAULT;
+  if(!wifiSsid.isEmpty())rememberRouterCredentials(wifiSsid,wifiPass);
 }
 // Device firmware responds to "update" with a non-retained /state frame.
 // The /status and /health messages are retained, so request samples as soon
@@ -2218,6 +2267,7 @@ void loop() {
     String cmd=Serial.readStringUntil('\n');cmd.trim();cmd.toUpperCase();
     if(cmd=="CONFIG") {
       settings.begin("energy28",false);settings.clear();settings.end();
+      clearRememberedRouters();
       ESP.restart();
     } else if(cmd=="PORTAL") {
       portalForced=true;beginPortal(wifiSsid.length()>0);
