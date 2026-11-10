@@ -1095,10 +1095,12 @@ void drawHistoryChart(bool full) {
         double delta=((double)(b.importWh-a.importWh)-
                       (double)(b.exportWh-a.exportWh))/1000.0;
         uint32_t begin=max(a.epoch,firstHour);
-        uint32_t finish=min(b.epoch,endHour+3600UL);
+        const uint32_t windowEnd=endHour+3600U;
+        uint32_t finish=b.epoch<windowEnd?b.epoch:windowEnd;
         for(uint32_t t=begin;t<finish;) {
           uint32_t slot=(t-firstHour)/3600UL;
-          uint32_t stop=min(finish,firstHour+(slot+1UL)*3600UL);
+          const uint32_t bucketEnd=firstHour+(slot+1U)*3600U;
+          uint32_t stop=finish<bucketEnd?finish:bucketEnd;
           if(slot<48 && stop>t) {
             values[slot]+=(float)(delta*((double)(stop-t)/(double)span));
             occupied[slot]=true;any=true;
