@@ -2421,7 +2421,10 @@ void handleWifiManagerTouch(int x,int y) {
   // display clear per keypress (the v0.11 flicker bug must not return).
   if(wifiUiMode==3) {
     wifiUiNotice("");
-    drawWifiPasswordStatus();
+    if(y>=78 && y<=103 && x<162) {
+      // SHIFT/SYMBOL changes the visible keycaps, not just the password field.
+      visibleLayout=-1;render();
+    } else drawWifiPasswordStatus();
   } else {visibleLayout=-1;render();}
 }
 // Two deliberate taps prevent accidental exposure of the maintenance AP.
