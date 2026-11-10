@@ -737,7 +737,7 @@ void settingsPage() {
     txt(218,190,String(wifiFailures),UI_RED,1);
     txt(11,206,"WEB: "+(portalActive?WiFi.softAPIP().toString():localIp()),UI_CYAN,1);
     lcd->fillRoundRect(206,198,105,24,5,UI_ACTIVE);
-    txt(213,206,setupConfirmUntil && !dueAt(setupConfirmUntil)?"CONFIRM":"OPEN AP",UI_WHITE,1);
+    txt(214,206,"SETTINGS",UI_WHITE,1);
   } else if(settingsPane==1) {
     txt(8,67,"MQTT DEBUG",UI_CYAN,2);
     card(4,87,312,137);
@@ -805,9 +805,20 @@ void updateMqttIndicator() {
   drawn=true;lastConnected=connected;
 }
 void render() {
-  const int16_t layout=chartOpen?20+(int16_t)chartPage:
+  const int16_t layout=wifiUiMode?30+(int16_t)wifiUiMode:
+      chartOpen?20+(int16_t)chartPage:
       settingsOpen?10+(int16_t)settingsPane:(int16_t)currentPage;
   const bool full=(layout!=visibleLayout);
+  if(wifiUiMode) {
+    if(full) {
+      visibleLayout=layout;
+      fullScreenDraws++;
+      drawWifiManager(true);
+    }
+    lastDraw=millis();
+    uiRefreshPending=false;
+    return;
+  }
   if(full) {
     visibleLayout=layout;
     memset(visibleCells,0,sizeof(visibleCells));
@@ -2205,7 +2216,7 @@ void drawWifiManager(bool full) {
     static const char* letters[4]={
       "1234567890","qwertyuiop","asdfghjkl-","zxcvbnm._@"};
     static const char* symbols[4]={
-      "~\`!@#$%^&*","()_+-=[]{}","\\|;:'\",.<>","?/01234567"};
+      "~`!@#$%^&*","()_+-=[]{}","\\|;:'\",.<>","?/01234567"};
     for(int row=0;row<4;row++) {
       const char *keys=wifiSymbols?symbols[row]:letters[row];
       for(int col=0;col<10;col++) {
@@ -2376,7 +2387,7 @@ void handleWifiManagerTouch(int x,int y) {
       static const char* letters[4]={
         "1234567890","qwertyuiop","asdfghjkl-","zxcvbnm._@"};
       static const char* symbols[4]={
-        "~\`!@#$%^&*","()_+-=[]{}","\\|;:'\",.<>","?/01234567"};
+        "~`!@#$%^&*","()_+-=[]{}","\\|;:'\",.<>","?/01234567"};
       char ch=(wifiSymbols?symbols[row]:letters[row])[col];
       if(wifiUppercase && !wifiSymbols && ch>='a' && ch<='z')
         ch=(char)(ch-'a'+'A');
@@ -2428,6 +2439,10 @@ void handleTouch() {
   int x=constrain((int)map(p.x,250,3800,0,319),0,319);
   int y=constrain((int)map(p.y,250,3800,0,239),0,239);
   Serial.printf("[TOUCH] raw=(%d,%d) -> (%d,%d)\n",p.x,p.y,x,y);
+  if(wifiUiMode) {
+    handleWifiManagerTouch(x,y);
+    return;
+  }
   // Persistent settings gear in the top-right corner, even in AP setup mode.
   if(x>=287 && y<=30) {
     if(chartOpen) {
@@ -2459,7 +2474,7 @@ void handleTouch() {
   }
   if(settingsOpen) {
     if(settingsPane==0 && x>=200 && y>=196 && y<=223) {
-      requestLocalSetupPortal();return;
+      openWifiManager();return;
     }
     if(settingsPane==1 && x>=8 && x<=115 && y>=190 && y<=222) {
       requestLocalSetupPortal();return;
@@ -2572,6 +2587,7 @@ void loop() {
     }
   }
   if(routesReady)webServer.handleClient();
+  serviceWifiManager();
   // CRITICAL: scheduled /save, /restart-esp and /forget-credentials
   // must execute even when credentials are empty. In ver0.13 the
   // no-credentials branch returned BEFORE the restart timer was checked.
