@@ -1797,6 +1797,14 @@ void mqttMessage(char *topic,byte *payload,unsigned int len) {
     return;
   }
   int type=typeById(id);
+  // Graphs reuse the sources' existing 48h MQTT history protocol.
+  // Treat history responses separately from /state, not as unknown topics.
+  if(suffix=="admin/history" || suffix=="vent/history" ||
+     suffix=="boiler/history") {
+    if(type<0 && chartOpen && ids[chartPage]==id)type=chartPage;
+    if(type>=0)handleChartMessage((uint8_t)type,suffix,payload,len);
+    return;
+  }
   if(suffix=="state" || suffix=="health") {
     incomingState.clear();
     DeserializationError err=deserializeJson(incomingState,(const char*)payload,len);
@@ -1982,6 +1990,9 @@ void maintainConnection() {
       if(!mqttSubs[0])mqttSubs[0]=mqtt.subscribe("home/energy/+/state");
       if(!mqttSubs[1])mqttSubs[1]=mqtt.subscribe("home/energy/+/status");
       if(!mqttSubs[2])mqttSubs[2]=mqtt.subscribe("home/energy/+/health");
+      if(!chartSubs[0])chartSubs[0]=mqtt.subscribe("home/energy/+/admin/history");
+      if(!chartSubs[1])chartSubs[1]=mqtt.subscribe("home/energy/+/vent/history");
+      if(!chartSubs[2])chartSubs[2]=mqtt.subscribe("home/energy/+/boiler/history");
       nextSubRetryAt=millis()+30000UL;
     }
     return;
@@ -1998,6 +2009,11 @@ void maintainConnection() {
     mqttSubs[0]=mqtt.subscribe("home/energy/+/state");
     mqttSubs[1]=mqtt.subscribe("home/energy/+/status");
     mqttSubs[2]=mqtt.subscribe("home/energy/+/health");
+    chartSubs[0]=mqtt.subscribe("home/energy/+/admin/history");
+    chartSubs[1]=mqtt.subscribe("home/energy/+/vent/history");
+    chartSubs[2]=mqtt.subscribe("home/energy/+/boiler/history");
+    Serial.printf("[HISTORY] subscriptions energy=%d vent=%d boiler=%d\n",
+                  chartSubs[0],chartSubs[1],chartSubs[2]);
     const String ownAdmin=displayTopic("admin/request");
     const String ownRequest=displayTopic("request");
     bool adminSub=mqtt.subscribe(ownAdmin.c_str());
@@ -2052,11 +2068,31 @@ void handleTouch() {
   Serial.printf("[TOUCH] raw=(%d,%d) -> (%d,%d)\n",p.x,p.y,x,y);
   // Persistent settings gear in the top-right corner, even in AP setup mode.
   if(x>=287 && y<=30) {
+    if(chartOpen) {
+      chartOpen=false;chartLoading=false;chartDirty=false;visibleLayout=-1;
+    }
     settingsOpen=!settingsOpen;
     if(settingsOpen) {
       settingsPane=0;render();
     } else if(portalActive)drawSetup();
     else render();
+    return;
+  }
+  if(chartOpen) {
+    // History display: touching anywhere in the plot returns to live values.
+    // Top navigation still works, including a fresh MQTT request on the active tab.
+    if(y>=29 && y<=64) {
+      uint8_t tab=constrain(x/80,0,3);
+      if(tab==currentPage) {
+        requestDevice(tab,true);
+        chartDirty=true;render();
+      } else {
+        chartOpen=false;chartLoading=false;chartDirty=false;
+        visibleLayout=-1;currentPage=tab;
+        if(!live(tab))requestDevice(tab,true);
+        render();
+      }
+    } else closeHistoryChart();
     return;
   }
   if(settingsOpen) {
@@ -2085,15 +2121,25 @@ void handleTouch() {
     }
     return;
   }
-  if(portalActive)return; // Keep the AP instructions on-screen except for gear.
+  if(portalActive)return; // Keep AP setup screen visible except for gear.
   if(y>=29 && y<=64) {
     int newPage=constrain(x/80,0,3);
     if(currentPage!=newPage) {
       currentPage=newPage;
       if(!live(newPage))requestDevice(newPage,false);
       render();
+    } else {
+      // Explicit user touch always requests a new /state, even if already LIVE.
+      bool sent=requestDevice(currentPage,true);
+      Serial.printf("[TOUCH] active tab %u immediate MQTT update=%d\n",
+                    (unsigned)currentPage,sent?1:0);
+      uiRefreshPending=true;
     }
+    return;
   }
+  // Main body tap opens the selected device's true 48h history.
+  // No invented data: if the source has no stored history, show NO HISTORY.
+  if(y>=65)startHistoryChart(currentPage);
 }
 void setup() {
   Serial.begin(115200);
@@ -2185,6 +2231,7 @@ void loop() {
   maintainConnection();
   handleTouch();
   serviceDeviceProbes();
+  serviceHistoryChart();
   if(mqtt.connected()) {
     if(displayStateRequested || dueAt(nextDisplayHealthAt)) {
       displayStateRequested=false;publishDisplaySnapshot(true);
@@ -2192,9 +2239,12 @@ void loop() {
     if(millis()-lastPoll>60000UL)requestAll();
     if(displayOtaJob.pending)performDisplayOta();
   }
-  if((!portalActive || settingsOpen) &&
-     ((uiRefreshPending && millis()-lastDraw>=UI_REFRESH_MIN_MS) ||
-      millis()-lastDraw>10000UL))render();
+  if(!portalActive || settingsOpen) {
+    if(chartOpen) {
+      if(chartDirty && millis()-lastDraw>=800UL)render();
+    } else if((uiRefreshPending && millis()-lastDraw>=UI_REFRESH_MIN_MS) ||
+              millis()-lastDraw>10000UL)render();
+  }
   if(millis()-lastHealthLine>60000UL) {
     lastHealthLine=millis();Serial.println(jsonStatus());
   }
