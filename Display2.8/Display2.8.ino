@@ -541,6 +541,10 @@ void topbar() {
 }
 void footer() {
   lcd->fillRect(0,226,320,14,UI_BG);
+  if(chartOpen) {
+    txt(7,231,"TAP ANYWHERE TO GO BACK",UI_CYAN,1);
+    return;
+  }
   if(settingsOpen) {
     txt(7,231,settingsPane==2?"TAP DEVICE ROW / GEAR BACK":"SETTINGS / GEAR TO RETURN",UI_MUTED,1);
     return;
@@ -781,7 +785,8 @@ void updateMqttIndicator() {
   drawn=true;lastConnected=connected;
 }
 void render() {
-  const int16_t layout=settingsOpen?10+(int16_t)settingsPane:(int16_t)currentPage;
+  const int16_t layout=chartOpen?20+(int16_t)chartPage:
+      settingsOpen?10+(int16_t)settingsPane:(int16_t)currentPage;
   const bool full=(layout!=visibleLayout);
   if(full) {
     visibleLayout=layout;
@@ -792,8 +797,10 @@ void render() {
     partialScreenDraws++;
     updateMqttIndicator();
   }
-  if(settingsOpen) {
-    settingsPage(); // Diagnostics are refreshed less often than live sensor values.
+  if(chartOpen) {
+    if(full || chartDirty)drawHistoryChart(full);
+  } else if(settingsOpen) {
+    settingsPage(); // Diagnostics refresh less often than live sensor values.
   } else {
     switch(currentPage) {
       case 0:ddsPage(full);break;
@@ -805,6 +812,355 @@ void render() {
   footer();
   lastDraw=millis();
   uiRefreshPending=false;
+}
+// ---------- Native TFT history: exactly the existing 48-hour MQTT protocols ----------
+int compareChartEnergy(const void *a,const void *b) {
+  const auto &x=*static_cast<const EnergyHistoryPoint*>(a);
+  const auto &y=*static_cast<const EnergyHistoryPoint*>(b);
+  return x.epoch<y.epoch?-1:x.epoch>y.epoch?1:0;
+}
+bool chartTokenPart(const String &s,int &position,String &part) {
+  if(position<0 || position>=(int)s.length())return false;
+  int sep=s.indexOf('|',position);
+  if(sep<0){part=s.substring(position);position=s.length();return true;}
+  part=s.substring(position,sep);position=sep+1;return true;
+}
+bool chartUnsigned(const String &s,uint32_t &out) {
+  if(!s.length()||s[0]=='-')return false;
+  char *end=nullptr;
+  unsigned long x=strtoul(s.c_str(),&end,10);
+  if(!end || *end || end==s.c_str())return false;
+  out=(uint32_t)x;return true;
+}
+bool chartUnsigned64(const String &s,uint64_t &out) {
+  if(!s.length()||s[0]=='-')return false;
+  char *end=nullptr;
+  unsigned long long x=strtoull(s.c_str(),&end,10);
+  if(!end || *end || end==s.c_str())return false;
+  out=(uint64_t)x;return true;
+}
+float chartTemperature(const String &s) {
+  if(s=="null" || !s.length())return NAN;
+  char *end=nullptr;
+  float v=strtof(s.c_str(),&end);
+  if(!end || *end || end==s.c_str() || !isfinite(v) ||
+     v<(-55.0f)||v>125.0f)return NAN;
+  return v;
+}
+void chartFail(const char *reason) {
+  snprintf(chartError,sizeof(chartError),"%s",reason);
+  chartLoading=false;chartDirty=true;
+  Serial.printf("[HISTORY] %s (page=%u)%s\n",reason,(unsigned)chartPage,
+                mqtt.connected()?"":" MQTT OFF");
+}
+bool chartRequestEnergy(long offset) {
+  if(!mqtt.connected() || chartPage>1 || ids[chartPage].isEmpty() ||
+     offset<0 || offset>10000 || chartRequests>=30)return false;
+  chartOffset=offset;chartToken=esp_random();
+  if(!chartToken)chartToken=1;
+  chartEnergyBegun=false;chartPageRows=0;chartRequestAt=millis();
+  chartLastDataAt=millis();
+  const String msg="history_get|"+String(chartToken)+"|0|"+String(offset);
+  const String topic="home/energy/"+ids[chartPage]+"/admin/request";
+  bool sent=mqtt.publish(topic.c_str(),msg.c_str());
+  if(sent)chartRequests++;
+  Serial.printf("[HISTORY] Energy page %ld request=%d\n",offset,sent?1:0);
+  return sent;
+}
+bool chartRequestTemperatures(uint8_t phase) {
+  if(!mqtt.connected() || chartPage<2 || chartPage>3 ||
+     ids[chartPage].isEmpty())return false;
+  chartPhase=phase;chartLastDataAt=millis();
+  const String cmd=chartPage==3?"boiler_history|":"vent_history|";
+  const String msg=cmd+(phase?"previous":"current");
+  const String topic="home/energy/"+ids[chartPage]+"/admin/request";
+  bool sent=mqtt.publish(topic.c_str(),msg.c_str());
+  if(sent)chartRequests++;
+  Serial.printf("[HISTORY] %s phase=%u sent=%d\n",
+                ids[chartPage].c_str(),(unsigned)phase,sent?1:0);
+  return sent;
+}
+void startHistoryChart(uint8_t page) {
+  if(page>3)return;
+  chartOpen=true;chartPage=page;chartLoading=true;chartComplete=false;
+  chartDirty=true;chartEnergyCount=0;chartRequests=0;chartFrames=0;
+  chartPhase=0;chartOffset=0;chartRecentFirst=-1;
+  chartEnergyBegun=false;chartPageRows=0;
+  chartRequestAt=millis();chartLastDataAt=millis();chartError[0]=0;
+  memset(chartTempBlocks,0,sizeof(chartTempBlocks));
+  for(int c=0;c<4;c++)
+    for(int i=0;i<192;i++)chartTemperatures[c][i]=NAN;
+  visibleLayout=-1; // Force a new chart layout, not a redraw of the live tab.
+  if(!mqtt.connected())chartFail("MQTT DISCONNECTED");
+  else if(ids[page].isEmpty())chartFail("DEVICE NOT DISCOVERED");
+  else if(page<2) {
+    if(!chartSubs[0])chartFail("HISTORY SUBSCRIPTION OFF");
+    else if(!chartRequestEnergy(0))chartFail("REQUEST FAILED");
+  } else {
+    if(!chartSubs[page==2?1:2])chartFail("HISTORY SUBSCRIPTION OFF");
+    else if(!chartRequestTemperatures(0))chartFail("REQUEST FAILED");
+  }
+  render();
+}
+void closeHistoryChart() {
+  if(!chartOpen)return;
+  chartOpen=false;chartLoading=false;chartDirty=false;visibleLayout=-1;
+  render();
+}
+void chartTemperaturePacket(const String &msg) {
+  if(!chartLoading || chartPage<2)return;
+  int start=0;
+  String part,type,range;
+  if(!chartTokenPart(msg,start,type) ||
+     !chartTokenPart(msg,start,range))return;
+  if(range!=(chartPhase?"previous":"current"))return;
+  if(type=="E") {
+    bool complete=true;
+    for(int k=0;k<12;k++)if(!chartTempBlocks[chartPhase][k])complete=false;
+    if(!complete) {
+      chartFail("HISTORY INCOMPLETE");return;
+    }
+    if(chartPhase==0) {
+      if(!chartRequestTemperatures(1))chartFail("PREVIOUS REQUEST FAILED");
+    } else {
+      chartLoading=false;chartComplete=true;
+      chartDirty=true;
+      Serial.printf("[HISTORY] 48h temperature complete: page %u\n",
+                    (unsigned)chartPage);
+    }
+    return;
+  }
+  if(type!="R")return;
+  uint32_t index=0;
+  if(!chartTokenPart(msg,start,part)||!chartUnsigned(part,index) ||
+     index>88 || index%8!=0)return;
+  uint8_t block=index/8;
+  if(chartTempBlocks[chartPhase][block])return;
+  const int channels=chartPage==3?4:2;
+  float samples[4][8]; // small local decoded block, commit only on full validation.
+  for(int i=0;i<8;i++) {
+    if(!chartTokenPart(msg,start,part))return;
+    int pos=0;
+    for(int k=0;k<channels;k++) {
+      int comma=part.indexOf(',',pos);
+      if(k+1<channels && comma<0)return;
+      String value=part.substring(pos,comma<0?part.length():comma);
+      float number=chartTemperature(value);
+      if(!isfinite(number) && value!="null")return;
+      samples[k][i]=number;
+      pos=comma<0?part.length():comma+1;
+    }
+    if(pos<(int)part.length())return;
+  }
+  const int base=(chartPhase?0:96)+(int)index;
+  for(int i=0;i<8;i++)
+    for(int k=0;k<channels;k++)
+      chartTemperatures[k][base+i]=samples[k][i];
+  chartTempBlocks[chartPhase][block]=true;
+  chartLastDataAt=millis();chartFrames++;chartDirty=true;
+}
+void chartEnergyPacket(const String &msg) {
+  if(!chartLoading || chartPage>1)return;
+  int position=0;
+  String part,type;
+  if(!chartTokenPart(msg,position,type) ||
+     !chartTokenPart(msg,position,part))return;
+  uint32_t token=0;
+  if(!chartUnsigned(part,token) || token!=chartToken)return;
+  if(type=="B") {
+    uint32_t mode=1;
+    if(!chartTokenPart(msg,position,part)||
+       !chartUnsigned(part,mode)||mode!=0)return;
+    // The sender's B frame ends in its reference epoch.
+    int at=msg.lastIndexOf('|');
+    uint32_t epoch=0;
+    if(at<0 || !chartUnsigned(msg.substring(at+1),epoch))return;
+    chartAnchorEpoch=epoch;
+    chartEnergyBegun=true;chartPageRows=0;
+    chartLastDataAt=millis();
+    return;
+  }
+  if(!chartEnergyBegun)return;
+  if(type=="P") {
+    EnergyHistoryPoint point;
+    if(!chartTokenPart(msg,position,part) ||
+       !chartUnsigned(part,point.epoch))return;
+    if(!chartTokenPart(msg,position,part) ||
+       !chartUnsigned(part,point.generation))return;
+    if(!chartTokenPart(msg,position,part) ||
+       !chartUnsigned64(part,point.importWh))return;
+    if(!chartTokenPart(msg,position,part) ||
+       !chartUnsigned64(part,point.exportWh))return;
+    chartPageRows++;chartLastDataAt=millis();
+    if(chartEnergyCount<CHART_ENERGY_CAPACITY) {
+      chartEnergy[chartEnergyCount++]=point;chartFrames++;
+    }
+    chartDirty=true;
+    return;
+  }
+  if(type=="E") {
+    if(!chartTokenPart(msg,position,part))return;
+    char *end=nullptr;
+    long next=strtol(part.c_str(),&end,10);
+    if(!end||*end)return;
+    if(!chartTokenPart(msg,position,part))return;
+    uint32_t declared=0;
+    if(!chartUnsigned(part,declared)||declared!=chartPageRows) {
+      chartFail("MISSING HISTORY PACKETS");return;
+    }
+    chartEnergyBegun=false;chartLastDataAt=millis();
+    if(chartPhase==0) {
+      if(chartOffset==0 && next>0 && chartPageRows)
+        chartRecentFirst=max(0L,next-(long)chartPageRows);
+      if(next>=0 && next>chartOffset && chartPageRows &&
+         chartEnergyCount<CHART_ENERGY_CAPACITY) {
+        if(!chartRequestEnergy(next))chartFail("MORE HISTORY FAILED");
+        return;
+      }
+      chartPhase=1;
+      if(chartRecentFirst>1 && chartEnergyCount<CHART_ENERGY_CAPACITY) {
+        if(!chartRequestEnergy(max(1L,chartRecentFirst-16L)))
+          chartFail("OLDER HISTORY FAILED");
+        return;
+      }
+    } else {
+      uint32_t oldest=UINT32_MAX;
+      for(int i=0;i<(int)chartEnergyCount;i++)
+        oldest=min(oldest,chartEnergy[i].epoch);
+      uint32_t limit=(chartAnchorEpoch>48UL*3600UL)?
+         chartAnchorEpoch-48UL*3600UL:0UL;
+      if(chartOffset>1 && oldest>limit && chartPageRows &&
+         chartEnergyCount<CHART_ENERGY_CAPACITY) {
+        if(!chartRequestEnergy(max(1L,chartOffset-16L)))
+          chartFail("OLDER HISTORY FAILED");
+        return;
+      }
+    }
+    chartComplete=true;chartLoading=false;chartDirty=true;
+    Serial.printf("[HISTORY] 48h energy done, checkpoints=%u\n",
+                  (unsigned)chartEnergyCount);
+  }
+}
+void handleChartMessage(uint8_t deviceType,const String &suffix,
+                        const byte *payload,unsigned int length) {
+  if(!chartOpen || deviceType!=chartPage || length>1800)return;
+  if(chartPage<2 && suffix!="admin/history")return;
+  if(chartPage==2 && suffix!="vent/history")return;
+  if(chartPage==3 && suffix!="boiler/history")return;
+  String msg;msg.reserve(length+2);
+  for(unsigned i=0;i<length;i++)msg+=(char)payload[i];
+  if(chartPage<2)chartEnergyPacket(msg);
+  else chartTemperaturePacket(msg);
+}
+void serviceHistoryChart() {
+  if(!chartOpen)return;
+  if(chartLoading && (!mqtt.connected() ||
+      millis()-chartLastDataAt>23000UL))
+    chartFail(mqtt.connected()?"HISTORY TIMEOUT":"MQTT DISCONNECTED");
+}
+void drawHistoryChart(bool full) {
+  // The surrounding navigation stays intact; only graph content is redrawn.
+  lcd->fillRect(0,64,320,162,UI_BG);
+  const char *names[4]={"ARTEMIDA","NESTOU 5A","VENT","BOILER"};
+  txt(8,67,String(names[chartPage])+" - 48H",UI_CYAN,2);
+  txt(216,70,chartLoading?"LOADING":chartComplete?"COMPLETE":"PARTIAL",
+      chartComplete?UI_GREEN:UI_YELLOW,1);
+  if(chartError[0])txt(8,90,String(chartError).substring(0,45),UI_RED,1);
+  else txt(8,90,"MQTT HISTORY / "+String(chartFrames)+" FRAMES",UI_MUTED,1);
+  const int left=28,right=313,top=107,bottom=196;
+  lcd->drawRect(left,top,right-left+1,bottom-top+1,UI_BORDER);
+  lcd->drawFastHLine(left,top+(bottom-top)/2,right-left,UI_BORDER);
+  lcd->drawFastVLine((left+right)/2,top,bottom-top,UI_BORDER);
+  txt(left,200,"-48h",UI_MUTED,1);
+  txt((left+right)/2-12,200,"-24h",UI_MUTED,1);
+  txt(right-23,200,"now",UI_MUTED,1);
+
+  bool any=false;
+  if(chartPage<2) {
+    float values[48]={0};
+    bool occupied[48]={false};
+    uint32_t anchor=chartAnchorEpoch;
+    if(anchor<1600000000UL)anchor=(uint32_t)time(nullptr);
+    if(anchor>=1600000000UL) {
+      qsort(chartEnergy,chartEnergyCount,sizeof(chartEnergy[0]),compareChartEnergy);
+      uint32_t endHour=(anchor/3600UL)*3600UL;
+      uint32_t firstHour=endHour-47UL*3600UL;
+      for(int i=1;i<(int)chartEnergyCount;i++) {
+        const auto &a=chartEnergy[i-1],&b=chartEnergy[i];
+        uint32_t span=b.epoch-a.epoch;
+        if(b.epoch<=a.epoch || span>7200UL ||
+           a.generation!=b.generation ||
+           b.importWh<a.importWh || b.exportWh<a.exportWh ||
+           b.epoch<=firstHour || a.epoch>=endHour+3600UL)continue;
+        double delta=((double)(b.importWh-a.importWh)-
+                      (double)(b.exportWh-a.exportWh))/1000.0;
+        uint32_t begin=max(a.epoch,firstHour);
+        uint32_t finish=min(b.epoch,endHour+3600UL);
+        for(uint32_t t=begin;t<finish;) {
+          uint32_t slot=(t-firstHour)/3600UL;
+          uint32_t stop=min(finish,firstHour+(slot+1UL)*3600UL);
+          if(slot<48 && stop>t) {
+            values[slot]+=(float)(delta*((double)(stop-t)/(double)span));
+            occupied[slot]=true;any=true;
+          }
+          t=stop;
+        }
+      }
+      float maxAbs=0.1f;
+      for(int i=0;i<48;i++)if(occupied[i])
+        maxAbs=max(maxAbs,fabsf(values[i]));
+      int zeroY=(top+bottom)/2;
+      for(int i=0;i<48;i++)if(occupied[i]) {
+        int x=left+2+i*(right-left-4)/48;
+        int height=(int)(fabsf(values[i])*((bottom-top-6)/2)/maxAbs);
+        if(height==0 && values[i]!=0)height=1;
+        if(height) {
+          int y=values[i]>=0?zeroY-height:zeroY;
+          lcd->fillRect(x,y,4,height,values[i]>=0?UI_GREEN:UI_YELLOW);
+        }
+      }
+      txt(3,111,String(maxAbs,1),UI_MUTED,1);
+      txt(3,184,"-"+String(maxAbs,1),UI_MUTED,1);
+    }
+    txt(10,213,"NET kWh/hr  (+ import / - export)",UI_WHITE,1);
+  } else {
+    const int channels=chartPage==3?4:2;
+    float low=999,high=-999;
+    for(int k=0;k<channels;k++)for(int i=0;i<192;i++) {
+      float v=chartTemperatures[k][i];
+      if(isfinite(v)){low=min(low,v);high=max(high,v);any=true;}
+    }
+    if(any) {
+      if(high-low<1.0f) {low-=0.5f;high+=0.5f;}
+      else {low-=0.4f;high+=0.4f;}
+      const uint16_t colors[4]={UI_CYAN,UI_YELLOW,UI_GREEN,UI_RED};
+      for(int k=0;k<channels;k++) {
+        bool prev=false;
+        int prevX=0,prevY=0;
+        for(int i=0;i<192;i++) {
+          float v=chartTemperatures[k][i];
+          if(!isfinite(v)){prev=false;continue;}
+          int x=left+2+i*(right-left-4)/191;
+          int y=bottom-2-(int)((v-low)*(bottom-top-4)/(high-low));
+          y=constrain(y,top+1,bottom-1);
+          if(prev)lcd->drawLine(prevX,prevY,x,y,colors[k]);
+          else lcd->fillRect(x,y,2,2,colors[k]);
+          prev=true;prevX=x;prevY=y;
+        }
+      }
+      txt(1,111,String(high,0),UI_MUTED,1);
+      txt(1,185,String(low,0),UI_MUTED,1);
+    }
+    if(chartPage==3)
+      txt(8,213,"T1 CYAN T2 YELLOW T3 GREEN T4 RED",UI_WHITE,1);
+    else
+      txt(8,213,"INSIDE CYAN / OUTSIDE YELLOW",UI_WHITE,1);
+  }
+  if(!any && !chartLoading)
+    txt(81,146,"NO RECORDED HISTORY",UI_YELLOW,1);
+  if(!any && chartLoading)
+    txt(94,146,"LOADING HISTORY",UI_CYAN,1);
+  chartDirty=false;
 }
 // Preserve a readable TFT screen even when AP startup, TLS, or networking fails.
 void drawStartupStage(const String &stage, bool error=false) {
