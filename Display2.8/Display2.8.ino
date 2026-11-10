@@ -90,7 +90,7 @@ int32_t wifiFoundDbm[18]={};
 bool wifiFoundSecured[18]={};
 bool wifiScanBusy=false,wifiScanQueued=false;
 uint32_t wifiScanAt=0,wifiUiConfirmUntil=0;
-bool wifiPasswordChanged=false,wifiHasSavedPassword=false,wifiUppercase=false,wifiSymbols=false;
+bool wifiPasswordChanged=false,wifiHasSavedPassword=false,wifiSelectedSecure=true,wifiUppercase=false,wifiSymbols=false;
 char wifiUiMessage[52]={};
 void openWifiManager();
 void handleWifiManagerTouch(int x,int y);
@@ -2104,6 +2104,300 @@ void maintainConnection() {
     nextMqttAttempt=millis()+delayMs;
     Serial.printf("[MQTT] state=%d retry in %lu ms\n",mqtt.state(),(unsigned long)delayMs);
   }
+}
+// --------- CYD 320x240 self-contained Wi-Fi settings touch interface ---------
+void wifiButton(int x,int y,int w,int h,const String &label,
+                uint16_t color=UI_ACTIVE) {
+  lcd->fillRoundRect(x,y,w,h,5,color);
+  txt(x+5,y+(h-8)/2,label,UI_WHITE,1);
+}
+void wifiUiNotice(const char *message) {
+  snprintf(wifiUiMessage,sizeof(wifiUiMessage),"%s",message);
+}
+void wifiScanRefresh() {
+  if(wifiScanBusy || displayOtaBusy)return;
+  wifiScanQueued=true;
+  wifiUiNotice("Scanning available WiFi networks...");
+}
+void openWifiManager() {
+  wifiUiMode=1;wifiListOffset=0;wifiFoundCount=0;
+  wifiUiConfirmUntil=0;wifiScanBusy=false;
+  wifiUiNotice("WiFi scan starting...");
+  wifiScanRefresh();
+  visibleLayout=-1;render();
+}
+void wifiSelectRouter(int index) {
+  if(index<0 || index>=(int)wifiFoundCount)return;
+  wifiSelectedSsid=wifiFoundSsid[index];
+  wifiSelectedSecure=wifiFoundSecured[index];
+  String existing;
+  wifiHasSavedPassword=findRouterCredentials(wifiSelectedSsid,existing) &&
+                        !existing.isEmpty();
+  existing=""; // Nothing from stored NVS is put into the UI.
+  wifiDraftPassword="";
+  wifiPasswordChanged=false;wifiUppercase=false;wifiSymbols=false;
+  wifiUiConfirmUntil=0;
+  wifiUiMode=3;visibleLayout=-1;
+  wifiUiNotice(wifiHasSavedPassword?"Saved password available":"Enter WiFi password");
+  render();
+}
+String wifiMaskedPassword() {
+  if(!wifiPasswordChanged)
+    return wifiHasSavedPassword?"********  SAVED":"[ EMPTY ]";
+  if(wifiDraftPassword.isEmpty())return "[ EMPTY ]";
+  String mask;
+  const int count=min(20,(int)wifiDraftPassword.length());
+  for(int i=0;i<count;i++)mask+='*';
+  if(wifiDraftPassword.length()>20)mask+="...";
+  return mask;
+}
+void drawWifiManager(bool full) {
+  if(!full)return; // Do not repaint the keyboard on ordinary MQTT updates.
+  lcd->fillScreen(UI_BG);
+  if(wifiUiMode==1) {
+    txt(7,8,"WIFI SETTINGS",UI_CYAN,2);
+    wifiButton(258,3,57,27,"BACK",UI_TABOFF);
+    txt(8,36,"AVAILABLE SSID",UI_MUTED,1);
+    txt(151,36,"dBm",UI_MUTED,1);
+    for(int i=0;i<5;i++) {
+      int index=wifiListOffset+i;
+      int y=52+i*32;
+      lcd->fillRoundRect(5,y,198,29,4,UI_PANEL);
+      if(index<(int)wifiFoundCount) {
+        txt(12,y+9,wifiFoundSsid[index].substring(0,21),UI_WHITE,1);
+        txt(157,y+9,String(wifiFoundDbm[index]),UI_CYAN,1);
+      }
+    }
+    wifiButton(209,53,105,42,wifiUiConfirmUntil &&
+      !dueAt(wifiUiConfirmUntil)?"CONFIRM AP":"OPEN AP");
+    wifiButton(209,104,105,43,"CHANGE");
+    txt(232,127,"ROUTER",UI_WHITE,1);
+    wifiButton(209,156,105,43,"SCAN");
+    txt(8,217,String(wifiUiMessage).substring(0,51),UI_YELLOW,1);
+  } else if(wifiUiMode==2) {
+    txt(7,7,"CHANGE ROUTER",UI_CYAN,2);
+    wifiButton(258,3,57,27,"BACK",UI_TABOFF);
+    txt(8,36,"SELECT A NETWORK   (dBm)",UI_MUTED,1);
+    for(int i=0;i<5;i++) {
+      int index=wifiListOffset+i;
+      int y=50+i*29;
+      lcd->fillRoundRect(5,y,309,27,4,UI_PANEL);
+      if(index<(int)wifiFoundCount) {
+        txt(12,y+9,wifiFoundSsid[index].substring(0,30),UI_WHITE,1);
+        txt(244,y+9,String(wifiFoundDbm[index]),UI_CYAN,1);
+        txt(284,y+9,wifiFoundSecured[index]?"LOCK":"OPEN",UI_MUTED,1);
+      }
+    }
+    wifiButton(5,200,99,31,"PREV",UI_TABOFF);
+    wifiButton(110,200,99,31,"NEXT",UI_TABOFF);
+    wifiButton(215,200,99,31,"RESCAN");
+  } else if(wifiUiMode==3) {
+    txt(6,4,"ROUTER PASSWORD",UI_CYAN,2);
+    wifiButton(258,3,57,27,"BACK",UI_TABOFF);
+    txt(8,32,"SSID: "+wifiSelectedSsid.substring(0,35),UI_WHITE,1);
+    txt(8,49,wifiSelectedSecure?"WPA PASSWORD:":"OPEN NETWORK:",UI_MUTED,1);
+    txt(8,63,wifiSelectedSecure?wifiMaskedPassword():"[ NO PASSWORD ]",UI_YELLOW,1);
+    wifiButton(4,78,76,25,wifiUppercase?"lower":"SHIFT",UI_TABOFF);
+    wifiButton(84,78,76,25,wifiSymbols?"abc":"SYMBOL",UI_TABOFF);
+    wifiButton(164,78,76,25,"DEL",UI_TABOFF);
+    wifiButton(244,78,72,25,
+      wifiUiConfirmUntil && !dueAt(wifiUiConfirmUntil)?"CONFIRM":"SAVE");
+    static const char* letters[4]={
+      "1234567890","qwertyuiop","asdfghjkl-","zxcvbnm._@"};
+    static const char* symbols[4]={
+      "~\`!@#$%^&*","()_+-=[]{}","\\|;:'\",.<>","?/01234567"};
+    for(int row=0;row<4;row++) {
+      const char *keys=wifiSymbols?symbols[row]:letters[row];
+      for(int col=0;col<10;col++) {
+        char c=keys[col];
+        if(wifiUppercase && !wifiSymbols && c>='a' && c<='z')
+          c=(char)(c-'a'+'A');
+        wifiButton(1+col*32,106+row*27,30,25,String(c),UI_TABOFF);
+      }
+    }
+    wifiButton(4,216,101,22,"SPACE",UI_TABOFF);
+    wifiButton(110,216,101,22,"CLEAR",UI_TABOFF);
+    if(wifiHasSavedPassword)
+      wifiButton(216,216,100,22,"KEEP SAVED",UI_ACTIVE);
+    else wifiButton(216,216,100,22,"NO SAVED",UI_PANEL);
+  }
+}
+void serviceWifiManager() {
+  if(wifiUiMode!=1 && wifiUiMode!=2)return;
+  if(wifiScanQueued && !wifiScanBusy) {
+    wifiScanQueued=false;
+    if(portalActive && WiFi.softAPgetStationNum()>0) {
+      wifiUiNotice("AP client active. Scan paused.");
+      visibleLayout=-1;render();return;
+    }
+    if(displayOtaBusy || displayOtaJob.pending) {
+      wifiUiNotice("OTA busy. Scan unavailable.");
+      visibleLayout=-1;render();return;
+    }
+    // ESP32 shares its AP+STA radio; preserve the SoftAP and MQTT session.
+    if(WiFi.getMode()==WIFI_AP)WiFi.mode(WIFI_AP_STA);
+    WiFi.scanDelete();
+    int16_t result=WiFi.scanNetworks(true,false);
+    if(result==WIFI_SCAN_FAILED) {
+      wifiUiNotice("Scan failed. Tap SCAN again.");
+      visibleLayout=-1;render();return;
+    }
+    wifiScanBusy=true;wifiScanAt=millis();
+    wifiUiNotice("Scanning...");
+    visibleLayout=-1;render();
+  }
+  if(!wifiScanBusy)return;
+  int16_t result=WiFi.scanComplete();
+  if(result==WIFI_SCAN_RUNNING && millis()-wifiScanAt<14000UL)return;
+  wifiScanBusy=false;wifiFoundCount=0;
+  if(result>=0) {
+    for(int i=0;i<result && wifiFoundCount<18;i++) {
+      String ssid=WiFi.SSID(i);ssid.trim();
+      if(ssid.isEmpty() || ssid.length()>32)continue;
+      int existing=-1;
+      for(int k=0;k<wifiFoundCount;k++)
+        if(wifiFoundSsid[k]==ssid){existing=k;break;}
+      if(existing>=0) {
+        if(WiFi.RSSI(i)>wifiFoundDbm[existing])
+          wifiFoundDbm[existing]=WiFi.RSSI(i);
+        continue;
+      }
+      const int n=wifiFoundCount++;
+      wifiFoundSsid[n]=ssid;
+      wifiFoundDbm[n]=WiFi.RSSI(i);
+      wifiFoundSecured[n]=WiFi.encryptionType(i)!=WIFI_AUTH_OPEN;
+    }
+    wifiUiNotice(wifiFoundCount?"Tap CHANGE ROUTER to select.":"No WiFi SSIDs found.");
+  } else wifiUiNotice("Scan timeout. Try again.");
+  WiFi.scanDelete();
+  if(wifiListOffset>=wifiFoundCount)wifiListOffset=0;
+  visibleLayout=-1;render();
+}
+void wifiSaveRouter() {
+  // Never accept an accidental one-touch change to the active router.
+  if(!wifiUiConfirmUntil || dueAt(wifiUiConfirmUntil)) {
+    wifiUiConfirmUntil=millis()+8000UL;
+    wifiUiNotice("Tap SAVE again to confirm.");
+    visibleLayout=-1;render();return;
+  }
+  wifiUiConfirmUntil=0;
+  String pass;
+  if(wifiPasswordChanged)pass=wifiDraftPassword;
+  else if(wifiHasSavedPassword) {
+    if(!findRouterCredentials(wifiSelectedSsid,pass)) {
+      wifiUiNotice("Saved password unavailable.");visibleLayout=-1;render();return;
+    }
+  }
+  if(!wifiSelectedSecure)pass="";
+  if(wifiSelectedSecure && pass.length()<8) {
+    wifiUiNotice("Password must have 8+ chars.");
+    visibleLayout=-1;render();return;
+  }
+  if(wifiSelectedSsid.isEmpty()||wifiSelectedSsid.length()>32||
+     pass.length()>64) {
+    wifiUiNotice("Invalid router credentials.");
+    visibleLayout=-1;render();return;
+  }
+  if(!settings.begin("energy28",false)) {
+    wifiUiNotice("NVS unavailable.");visibleLayout=-1;render();return;
+  }
+  size_t len1=settings.putString("ssid",wifiSelectedSsid);
+  size_t len2=settings.putString("wpass",pass);
+  settings.end();
+  if(len1!=wifiSelectedSsid.length() || len2!=pass.length()) {
+    wifiUiNotice("Saving credentials failed.");visibleLayout=-1;render();return;
+  }
+  rememberRouterCredentials(wifiSelectedSsid,pass);
+  Serial.println("[WIFI UI] New router saved; reboot scheduled");
+  // Clear temporary plaintext password RAM before restart.
+  wifiDraftPassword="";
+  pass="";
+  wifiUiMode=0;settingsOpen=false;
+  drawStartupStage("ROUTER SAVED / REBOOT");
+  restartAt=millis()+1700UL;
+}
+void handleWifiManagerTouch(int x,int y) {
+  if(y<32 && x>=248) {
+    wifiUiMode=wifiUiMode==1?0:wifiUiMode==2?1:2;
+    wifiUiConfirmUntil=0;
+    visibleLayout=-1;render();return;
+  }
+  if(wifiUiMode==1) {
+    if(x>=205 && y>=52 && y<=100) {
+      if(!wifiUiConfirmUntil || dueAt(wifiUiConfirmUntil)) {
+        wifiUiConfirmUntil=millis()+8000UL;
+        visibleLayout=-1;render();return;
+      }
+      wifiUiConfirmUntil=0;wifiUiMode=0;settingsOpen=false;
+      wifiScanBusy=false;WiFi.scanDelete();
+      portalForced=true;
+      if(!portalActive)beginPortal(!wifiSsid.isEmpty());
+      else drawSetup();
+      return;
+    }
+    if(x>=205 && y>=101 && y<=152) {
+      wifiUiMode=2;wifiListOffset=0;wifiUiConfirmUntil=0;
+      visibleLayout=-1;render();return;
+    }
+    if(x>=205 && y>=154 && y<=204){wifiScanRefresh();return;}
+    if(x<205 && y>=52 && y<212) {
+      // SSID list is informational here; router selection opens a new screen.
+      wifiUiMode=2;wifiUiConfirmUntil=0;
+      visibleLayout=-1;render();return;
+    }
+    return;
+  }
+  if(wifiUiMode==2) {
+    if(y>=50 && y<195) {
+      int index=(y-50)/29+wifiListOffset;
+      if(index<(int)wifiFoundCount)wifiSelectRouter(index);
+      return;
+    }
+    if(y>=200 && x<108) {
+      wifiListOffset=wifiListOffset>=5?wifiListOffset-5:0;
+    } else if(y>=200 && x<212) {
+      if(wifiListOffset+5<wifiFoundCount)wifiListOffset+=5;
+    } else if(y>=200)wifiScanRefresh();
+    visibleLayout=-1;render();return;
+  }
+  if(wifiUiMode!=3)return;
+  if(y>=78 && y<=103) {
+    if(x<81){wifiUppercase=!wifiUppercase;}
+    else if(x<162){wifiSymbols=!wifiSymbols;}
+    else if(x<242) {
+      if(!wifiPasswordChanged) {
+        wifiDraftPassword="";wifiPasswordChanged=true;
+      } else if(wifiDraftPassword.length())wifiDraftPassword.remove(wifiDraftPassword.length()-1);
+      wifiUiConfirmUntil=0;
+    } else {wifiSaveRouter();return;}
+  } else if(y>=106 && y<214 && x<320) {
+    int row=(y-106)/27,col=x/32;
+    if(row<4 && col<10 && wifiDraftPassword.length()<63) {
+      static const char* letters[4]={
+        "1234567890","qwertyuiop","asdfghjkl-","zxcvbnm._@"};
+      static const char* symbols[4]={
+        "~\`!@#$%^&*","()_+-=[]{}","\\|;:'\",.<>","?/01234567"};
+      char ch=(wifiSymbols?symbols[row]:letters[row])[col];
+      if(wifiUppercase && !wifiSymbols && ch>='a' && ch<='z')
+        ch=(char)(ch-'a'+'A');
+      if(!wifiPasswordChanged){wifiDraftPassword="";wifiPasswordChanged=true;}
+      wifiDraftPassword+=ch;
+      wifiUiConfirmUntil=0;
+    }
+  } else if(y>=216) {
+    if(x<108) {
+      if(wifiDraftPassword.length()<63) {
+        if(!wifiPasswordChanged){wifiDraftPassword="";wifiPasswordChanged=true;}
+        wifiDraftPassword+=' ';
+      }
+    } else if(x<213) {
+      wifiDraftPassword="";wifiPasswordChanged=true;
+    } else if(wifiHasSavedPassword) {
+      wifiDraftPassword="";wifiPasswordChanged=false;
+    }
+    wifiUiConfirmUntil=0;
+  }
+  visibleLayout=-1;render();
 }
 // Two deliberate taps prevent accidental exposure of the maintenance AP.
 void requestLocalSetupPortal() {
