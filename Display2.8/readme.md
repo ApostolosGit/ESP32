@@ -1,10 +1,28 @@
-# Display2.8 — Energy Monitor ver0.13
+# Display2.8 — Energy Monitor ver0.14
 
 **Hardware:** ESP32-2432S028 dual-USB, ESP32-D0WD-V3 (classic ESP32), 4 MB flash, 320×240 landscape ST7789, XPT2046 resistive touch.
 
-**Latest firmware:** `Display2.8-ver0.13.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
+**Latest firmware:** `Display2.8-ver0.14.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
 
-The GitHub Actions build has succeeded. **ver0.13 compiled successfully; HTTPS OTA and firmware flash still require a physical device test.**
+The GitHub Actions build has succeeded. **ver0.14 compiled and the matching app-only OTA was published successfully. The changes still require physical testing on the touchscreen, actual meters and AP.**
+
+## New in ver0.14 (10/11/2026): AP auto-restart and native 48-hour history graphs
+
+**AP credentials saved but not restarting:** Fixed a real control-flow defect in the main loop. Previously `/save` wrote Preferences and scheduled a restart for 1.4 seconds later, but the loop exited early when **any** credential was missing. The restart timer was therefore never checked during first-time AP provisioning. The new `restartAt` check runs immediately after servicing HTTP, before the empty-credentials early return. The page now confirms save and schedules reboot after 1.7 seconds; the serial monitor prints `[WEB] Saved configuration: restarting ESP32`. Confirm physically that the AP closes and STA boots with the newly saved data.
+
+**Touch actions on each normal tab:**
+
+- Tap the **currently selected tab header** again (ΑΡΤΕΜΙΔΑ, ΝΕΣΤΟΥ 5Α, VENT or BOILER): send an immediate non-actuating MQTT `update` to the discovered `home/energy/<source-id>/request` topic, whether measurements were previously LIVE or stale.
+- Tap the **measurement area** (below the headers) anywhere: open the native 320×240 TFT **48-hour history** for the selected device. Tap inside the chart again to return; the top tabs remain available for navigation, and the settings gear still works.
+- **DDS/JSY:** request existing source firmware `history_get|token|0|offset` pages and parse `/admin/history` checkpoint frames `B/P/E`. Plot net (import−export) energy in kWh per hour across 48 hourly slots. Only valid, monotonic, same-generation intervals of up to two hours are used; data are allocated proportionally to overlapping hours. Missing time ranges are blank.
+- **VENT:** use existing `vent_history|current` and `vent_history|previous` commands and `/vent/history` responses to draw inside/outside temperatures for two consecutive 24-hour calendar periods at 15-minute resolution (up to 192 points).
+- **BOILER:** use existing `boiler_history|current` and `boiler_history|previous` commands and `/boiler/history` responses for the four temperatures at the same resolution.
+- History responses are received over wildcard subscriptions, with bounded requests and timeouts; historical samples are **not fabricated** from current readings. If the source firmware is too old or has no stored records, the TFT displays the corresponding empty/timeout message. Graphs are **native on the TFT**, not images downloaded from the APP.
+- These graphs depend on the firmware and stored history on each source device and require testing with the real meter's MQTT history stream. No physical interaction tests have been performed.
+
+**OTA test in MQTT.app:** The published `manifest-display28.txt` now describes **`Display2.8-ver0.14-app-only.bin`** in `ApostolosGit/ESP32-OTA.bin`. On a display already running compatible remote-OTA firmware, use the APP's last **Display 2.8** card → **Έλεγχος OTA** → **OTA update** and confirm with the device PIN. The firmware verifies HTTPS, expected size, hardware profile and MD5 before reboot. If outbound HTTPS still fails, use APP's **Τοπικό OTA** to upload the source repository's **unversioned** `Display2.8-app-only.bin` via the device's local PIN-protected page. Do **not** send the MERGED image to OTA.
+
+**Always retain** the complete `Display2.8-ver0.14.bin` merged image for USB fallback at flash address `0x000000`. Keep a full flash backup before a merged rewrite.
 
 ## New in ver0.13 (09/11/2026): Trusted OTA HTTPS fix and setup PIN UI
 
@@ -125,7 +143,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 | Filename | Function |
 | --- | --- |
-| `Display2.8-ver0.13.bin` | **MERGED full firmware**, write at **`0x000000`** |
+| `Display2.8-ver0.14.bin` | **MERGED full firmware**, write at **`0x000000`** |
 | `Display2.8.bin` | Latest **MERGED** firmware, same offset |
 | `Display2.8-app-only.bin` | App-only image for compatible existing partitions/OTA; **not** a merged image |
 | `Display2.8.ino` | Main source |
@@ -135,6 +153,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 ### Version history
 
+- **ver0.14 (10/11/2026):** AP-save restart fix; active-tab MQTT refresh; 48h native TFT history graphs via existing energy/temperature MQTT protocols.
 - **ver0.13 (09/11/2026):** Dual-root GitHub TLS certificate bundle and HTTPS preflight/retries; local OTA fallback; PIN-length hints removed.
 - **ver0.12 (09/11/2026):** Delta-based TFT drawing, unchanged-value caching, no full-screen clear on MQTT updates, limited redraw rate.
 - **ver0.11 (09/11/2026):** Local PIN-gated management website on LAN and AP; edit saved WiFi/MQTT credentials, view diagnostics, restart, clear credentials or upload app-only OTA; two-tap TFT OPEN AP.
