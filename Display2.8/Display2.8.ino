@@ -2272,14 +2272,16 @@ void serviceWifiManager() {
   wifiScanBusy=false;wifiFoundCount=0;
   if(result>=0) {
     for(int i=0;i<result && wifiFoundCount<18;i++) {
-      String ssid=WiFi.SSID(i);ssid.trim();
+      String ssid=WiFi.SSID(i);
       if(ssid.isEmpty() || ssid.length()>32)continue;
       int existing=-1;
       for(int k=0;k<wifiFoundCount;k++)
         if(wifiFoundSsid[k]==ssid){existing=k;break;}
       if(existing>=0) {
-        if(WiFi.RSSI(i)>wifiFoundDbm[existing])
+        if(WiFi.RSSI(i)>wifiFoundDbm[existing]) {
           wifiFoundDbm[existing]=WiFi.RSSI(i);
+          wifiFoundSecured[existing]=WiFi.encryptionType(i)!=WIFI_AUTH_OPEN;
+        }
         continue;
       }
       const int n=wifiFoundCount++;
