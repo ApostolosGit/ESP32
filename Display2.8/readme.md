@@ -1,10 +1,26 @@
-# Display2.8 — Energy Monitor ver0.14
+# Display2.8 — Energy Monitor ver0.15
 
 **Hardware:** ESP32-2432S028 dual-USB, ESP32-D0WD-V3 (classic ESP32), 4 MB flash, 320×240 landscape ST7789, XPT2046 resistive touch.
 
-**Latest firmware:** `Display2.8-ver0.14.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
+**Latest firmware:** `Display2.8-ver0.15.bin` — complete **MERGED** image (bootloader + partition table + app), write at **`0x000000`**, Flash 4 MB, DIO. `Display2.8.bin` is identical to the current versioned merged build. **Back up the entire factory 4 MB flash before flashing.** Writing the merged image can also erase stored Wi-Fi/MQTT credentials.
 
-The GitHub Actions build has succeeded. **ver0.14 compiled and the matching app-only OTA was published successfully. The changes still require physical testing on the touchscreen, actual meters and AP.**
+The GitHub Actions build has succeeded. **ver0.15 compiles in CI, but Wi-Fi scanning, resistive-touch keyboard accuracy and router switching still require physical testing on the actual display.**
+
+## New in ver0.15 (10/11/2026): NET SETTINGS / SSID selection / on-screen Wi-Fi keyboard
+
+From the screen, tap the permanent gear icon and open **NET**. The previous lower-right **OPEN AP** button has been renamed **SETTINGS**. Tapping it opens the following **local TFT screens**, without requiring a browser:
+
+1. **WIFI SETTINGS:** Displays a fresh, asynchronous 2.4 GHz scan of nearby network names and their actual **RSSI in dBm**, with right-hand buttons **OPEN ACCESS POINT**, **CHANGE ROUTER**, and **SCAN**. The scanning page is read-only until an explicit action is selected.
+2. **CHANGE ROUTER:** A second screen lists discovered networks (SSID / signal level / OPEN or LOCK). Tap a row to choose it; use PREV/NEXT to move through multiple results or RESCAN to refresh them.
+3. **ROUTER PASSWORD:** A full-width resistive-touch on-screen keyboard with alphanumeric/symbol layouts, SHIFT, BACKSPACE (DEL), SPACE and CLEAR, plus SAVE and BACK. The password field is **always masked**. For the currently configured router or a previously remembered one, it displays a **fixed, non-length-revealing eight-star mask** and a **KEEP SAVED** action. The user can keep that password or type a replacement; never disclose the stored password in the TFT or MQTT.
+4. **Saving:** WPA password is validated, and SAVE requires a **second confirming touch within eight seconds** before the new SSID/credentials are persisted to the same `energy28` Preferences namespace as earlier versions. A scheduled restart then connects to the newly selected router. If unavailable, the previous **ESP-Display28 AP+STA recovery** continues to work.
+5. **OPEN ACCESS POINT:** Requires an explicit second touch to prevent accidental AP exposure. Opens or returns to the existing `ESP-Display28` maintenance AP without clearing settings.
+
+**Saved Wi-Fi history:** Up to **four routers** explicitly configured from ver0.15 onward are cached locally in a separate `wifi28` Preferences namespace. On the first ver0.15 boot, the currently configured router is also imported. Routers used only in older firmware versions cannot be restored automatically if the device no longer has their credentials. The `CONFIG` serial command and web **Reset Credentials** erase both saved active settings and this history.
+
+**Security:** Masking the password on screen prevents shoulder-surfing, but it does **not** encrypt on-device NVS: the ESP32 is not configured for flash encryption. Treat physical device/flash access as privileged. Wi-Fi scans may briefly affect networking because classic ESP32 has one shared AP/STA radio; scanning is deferred while a phone is attached to the recovery AP. Enterprise Wi-Fi authentication and hidden SSIDs are not managed by this UI; use the existing browser setup where appropriate.
+
+These changes are intended for hardware testing. Build success alone does not establish that the touch calibration, every special keyboard symbol or AP+STA radio behavior works on this particular CYD board.
 
 ## New in ver0.14 (10/11/2026): AP auto-restart and native 48-hour history graphs
 
@@ -143,7 +159,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 | Filename | Function |
 | --- | --- |
-| `Display2.8-ver0.14.bin` | **MERGED full firmware**, write at **`0x000000`** |
+| `Display2.8-ver0.15.bin` | **MERGED full firmware**, write at **`0x000000`** |
 | `Display2.8.bin` | Latest **MERGED** firmware, same offset |
 | `Display2.8-app-only.bin` | App-only image for compatible existing partitions/OTA; **not** a merged image |
 | `Display2.8.ino` | Main source |
@@ -153,6 +169,7 @@ This firmware is a classic ESP32 adaptation of relevant CommonPlatform v1.06 beh
 
 ### Version history
 
+- **ver0.15 (10/11/2026):** NET SETTINGS scan list with RSSI, AP controls, Change Router screen, masked on-screen credentials keyboard, four-router NVS cache, confirmed restart.
 - **ver0.14 (10/11/2026):** AP-save restart fix; active-tab MQTT refresh; 48h native TFT history graphs via existing energy/temperature MQTT protocols.
 - **ver0.13 (09/11/2026):** Dual-root GitHub TLS certificate bundle and HTTPS preflight/retries; local OTA fallback; PIN-length hints removed.
 - **ver0.12 (09/11/2026):** Delta-based TFT drawing, unchanged-value caching, no full-screen clear on MQTT updates, limited redraw rate.
