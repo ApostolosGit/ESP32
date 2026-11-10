@@ -2162,6 +2162,15 @@ String wifiMaskedPassword() {
   if(wifiDraftPassword.length()>20)mask+="...";
   return mask;
 }
+void drawWifiPasswordStatus() {
+  // Only redraw the two changing lines, not the whole SPI TFT for each key.
+  lcd->fillRect(2,47,316,30,UI_BG);
+  txt(8,49,wifiSelectedSecure?"WPA PASSWORD:":"OPEN NETWORK:",UI_MUTED,1);
+  if(wifiUiMessage[0])txt(126,49,String(wifiUiMessage).substring(0,31),UI_YELLOW,1);
+  txt(8,63,wifiSelectedSecure?wifiMaskedPassword():"[ NO PASSWORD ]",UI_YELLOW,1);
+  lcd->fillRoundRect(244,78,72,25,5,UI_ACTIVE);
+  txt(249,86,wifiUiConfirmUntil && !dueAt(wifiUiConfirmUntil)?"CONFIRM":"SAVE",UI_WHITE,1);
+}
 void drawWifiManager(bool full) {
   if(!full)return; // Do not repaint the keyboard on ordinary MQTT updates.
   lcd->fillScreen(UI_BG);
@@ -2180,7 +2189,9 @@ void drawWifiManager(bool full) {
       }
     }
     wifiButton(209,53,105,42,wifiUiConfirmUntil &&
-      !dueAt(wifiUiConfirmUntil)?"CONFIRM AP":"OPEN AP");
+      !dueAt(wifiUiConfirmUntil)?"CONFIRM AP":"OPEN ACCESS");
+    if(!wifiUiConfirmUntil || dueAt(wifiUiConfirmUntil))
+      txt(246,79,"POINT",UI_WHITE,1);
     wifiButton(209,104,105,43,"CHANGE");
     txt(232,127,"ROUTER",UI_WHITE,1);
     wifiButton(209,156,105,43,"SCAN");
@@ -2206,13 +2217,11 @@ void drawWifiManager(bool full) {
     txt(6,4,"ROUTER PASSWORD",UI_CYAN,2);
     wifiButton(258,3,57,27,"BACK",UI_TABOFF);
     txt(8,32,"SSID: "+wifiSelectedSsid.substring(0,35),UI_WHITE,1);
-    txt(8,49,wifiSelectedSecure?"WPA PASSWORD:":"OPEN NETWORK:",UI_MUTED,1);
-    txt(8,63,wifiSelectedSecure?wifiMaskedPassword():"[ NO PASSWORD ]",UI_YELLOW,1);
+    drawWifiPasswordStatus();
     wifiButton(4,78,76,25,wifiUppercase?"lower":"SHIFT",UI_TABOFF);
     wifiButton(84,78,76,25,wifiSymbols?"abc":"SYMBOL",UI_TABOFF);
     wifiButton(164,78,76,25,"DEL",UI_TABOFF);
-    wifiButton(244,78,72,25,
-      wifiUiConfirmUntil && !dueAt(wifiUiConfirmUntil)?"CONFIRM":"SAVE");
+    // SAVE/CONFIRM is drawn by drawWifiPasswordStatus().
     static const char* letters[4]={
       "1234567890","qwertyuiop","asdfghjkl-","zxcvbnm._@"};
     static const char* symbols[4]={
@@ -2408,7 +2417,12 @@ void handleWifiManagerTouch(int x,int y) {
     }
     wifiUiConfirmUntil=0;
   }
-  visibleLayout=-1;render();
+  // Typing and deleting change only the password/status field; no full
+  // display clear per keypress (the v0.11 flicker bug must not return).
+  if(wifiUiMode==3) {
+    wifiUiNotice("");
+    drawWifiPasswordStatus();
+  } else {visibleLayout=-1;render();}
 }
 // Two deliberate taps prevent accidental exposure of the maintenance AP.
 void requestLocalSetupPortal() {
