@@ -10,9 +10,9 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.06"
-#define VERSION "1.06"
-#define BUILD_DATE "03/11/2026"
+#define PLATFORM_VERSION "1.07"
+#define VERSION "1.07"
+#define BUILD_DATE "11/11/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
 #define DEVICE_LABEL "ESP32-C3"
@@ -122,6 +122,7 @@
 struct RtcOledDiagnostic;
 struct DeviceCredentialRecord;
 struct RtcCrashTrace;
+struct RuntimeBreadcrumbEntry; // Arduino automatic prototype generation
 struct RecoveryRecord;
 struct OledDiagnostic;
 enum class DisplayFont : uint8_t;
@@ -794,6 +795,93 @@ void clearRtcCrashTrace() {
     platformWriteRetained(&rtcCrashTraceStorage, &empty, sizeof(empty));
     rtcTraceBeforeReset = RtcCrashTrace();
     rtcTraceBeforeResetValid = false;
+}
+
+
+// Common Platform v1.07: bounded RTC-only runtime breadcrumb ring.
+// Each slot commits its magic LAST, making a watchdog-interrupted write
+// detectable by checksum. No flash writes, heap use, locks or ISR callbacks.
+enum RuntimeEvent : uint16_t {
+    RB_LOOP_BEGIN=1, RB_LOOP_IDLE=2,
+    RB_SENSOR_BEGIN=10, RB_SENSOR_END=11,
+    RB_OLED_BEGIN=20, RB_OLED_END=21,
+    RB_WIFI_BEGIN=30, RB_WIFI_END=31,
+    RB_WEB_BEGIN=40, RB_WEB_END=41,
+    RB_MQTT_BEGIN=50, RB_MQTT_END=51,
+    RB_MQTT_DNS_BEGIN=52, RB_MQTT_DNS_END=53,
+    RB_MQTT_TLS_BEGIN=54, RB_MQTT_TLS_END=55,
+    RB_LITTLEFS_BEGIN=60, RB_LITTLEFS_END=61,
+    RB_BACKGROUND_BEGIN=70, RB_BACKGROUND_END=71,
+    RB_ADMIN_BEGIN=80, RB_ADMIN_END=81,
+    RB_WIFI_STACK_BEGIN=90, RB_WIFI_STACK_END=91
+};
+static const uint8_t RUNTIME_BREADCRUMB_CAPACITY=12;
+static const uint32_t RUNTIME_BREADCRUMB_MAGIC=0x52544231UL;
+struct RuntimeBreadcrumbEntry {
+    uint32_t magic, sequence, uptimeMs;
+    uint16_t code, detail;
+    uint32_t checksum;
+};
+RTC_NOINIT_ATTR static volatile RuntimeBreadcrumbEntry rtcRuntimeBreadcrumbs[RUNTIME_BREADCRUMB_CAPACITY];
+RuntimeBreadcrumbEntry runtimeBeforeReset[RUNTIME_BREADCRUMB_CAPACITY] = {};
+uint8_t runtimeBeforeResetCount=0;
+uint32_t runtimeBreadcrumbSequence=0;
+
+uint32_t runtimeBreadcrumbChecksum(const RuntimeBreadcrumbEntry& b) {
+    return RUNTIME_BREADCRUMB_MAGIC ^ b.sequence ^ b.uptimeMs ^
+           (((uint32_t)b.code << 16) | (uint32_t)b.detail) ^ 0x39AC0B5DUL;
+}
+const char* runtimeBreadcrumbLabel(uint16_t code) {
+    switch(code) {
+        case RB_LOOP_BEGIN:return "LOOP_BEGIN"; case RB_LOOP_IDLE:return "LOOP_IDLE";
+        case RB_SENSOR_BEGIN:return "SENSOR_BEGIN"; case RB_SENSOR_END:return "SENSOR_END";
+        case RB_OLED_BEGIN:return "OLED_BEGIN"; case RB_OLED_END:return "OLED_END";
+        case RB_WIFI_BEGIN:return "WIFI_BEGIN"; case RB_WIFI_END:return "WIFI_END";
+        case RB_WEB_BEGIN:return "WEB_BEGIN"; case RB_WEB_END:return "WEB_END";
+        case RB_MQTT_BEGIN:return "MQTT_BEGIN"; case RB_MQTT_END:return "MQTT_END";
+        case RB_MQTT_DNS_BEGIN:return "MQTT_DNS_BEGIN"; case RB_MQTT_DNS_END:return "MQTT_DNS_END";
+        case RB_MQTT_TLS_BEGIN:return "MQTT_TLS_BEGIN"; case RB_MQTT_TLS_END:return "MQTT_TLS_END";
+        case RB_LITTLEFS_BEGIN:return "LITTLEFS_BEGIN"; case RB_LITTLEFS_END:return "LITTLEFS_END";
+        case RB_BACKGROUND_BEGIN:return "BACKGROUND_BEGIN"; case RB_BACKGROUND_END:return "BACKGROUND_END";
+        case RB_ADMIN_BEGIN:return "ADMIN_BEGIN"; case RB_ADMIN_END:return "ADMIN_END";
+        case RB_WIFI_STACK_BEGIN:return "WIFI_STACK_BEGIN"; case RB_WIFI_STACK_END:return "WIFI_STACK_END";
+        default:return "UNKNOWN";
+    }
+}
+void loadRtcRuntimeBreadcrumbs() {
+    runtimeBeforeResetCount=0;
+    // A power-on/brownout does not guarantee retained RTC bytes.
+    if (platformRtcContentsUsable()) {
+        for(uint8_t i=0;i<RUNTIME_BREADCRUMB_CAPACITY;++i) {
+            RuntimeBreadcrumbEntry b={};
+            platformReadRetained(&b,&rtcRuntimeBreadcrumbs[i],sizeof(b));
+            if(b.magic!=RUNTIME_BREADCRUMB_MAGIC ||
+               b.checksum!=runtimeBreadcrumbChecksum(b) || b.sequence==0) continue;
+            uint8_t j=runtimeBeforeResetCount++;
+            // Show oldest -> newest, without relying on RTC array positions.
+            while(j>0 && (int32_t)(b.sequence-runtimeBeforeReset[j-1].sequence)<0) {
+                runtimeBeforeReset[j]=runtimeBeforeReset[j-1];
+                --j;
+            }
+            runtimeBeforeReset[j]=b;
+        }
+    }
+    // The pre-reset snapshot is now in RAM. Start a clean log for this boot.
+    for(uint8_t i=0;i<RUNTIME_BREADCRUMB_CAPACITY;++i) rtcRuntimeBreadcrumbs[i].magic=0;
+    runtimeBreadcrumbSequence=0;
+}
+void runtimeBreadcrumb(uint16_t code,uint16_t detail=0) {
+    const uint32_t seq=++runtimeBreadcrumbSequence;
+    volatile RuntimeBreadcrumbEntry& slot=
+        rtcRuntimeBreadcrumbs[(seq-1)%RUNTIME_BREADCRUMB_CAPACITY];
+    const uint32_t tick=millis();
+    RuntimeBreadcrumbEntry b={};
+    b.sequence=seq; b.uptimeMs=tick; b.code=code; b.detail=detail;
+    b.checksum=runtimeBreadcrumbChecksum(b);
+    slot.magic=0;       // invalidate any previous record
+    slot.sequence=b.sequence; slot.uptimeMs=b.uptimeMs;
+    slot.code=b.code; slot.detail=b.detail; slot.checksum=b.checksum;
+    slot.magic=RUNTIME_BREADCRUMB_MAGIC; // commit
 }
 
 const char* crashStageLabel(uint32_t stage) {
@@ -1867,7 +1955,10 @@ void maintainMqtt(unsigned long now) {
     // TLS connection below (keep the hostname/SNI, not an IP-only TLS connect).
     bootCheckpoint(CRASH_STAGE_BOOT_MQTT_DNS);
     IPAddress brokerIp;
-    if (platformResolveHost(mqttHost, brokerIp, MQTT_DNS_TIMEOUT_MS) != 1) {
+    runtimeBreadcrumb(RB_MQTT_DNS_BEGIN);
+    const int mqttDnsResult=platformResolveHost(mqttHost,brokerIp,MQTT_DNS_TIMEOUT_MS);
+    runtimeBreadcrumb(RB_MQTT_DNS_END,(uint16_t)mqttDnsResult);
+    if (mqttDnsResult != 1) {
         mqttLastAttemptState = -2;
         snprintf(mqttLastSslErrorText, sizeof(mqttLastSslErrorText), "MQTT DNS unavailable");
         mqttConnectFailures++;
@@ -1909,6 +2000,7 @@ void maintainMqtt(unsigned long now) {
     // PubSubClient's packet-read timeout.
     mqttNet.setConnectionTimeout(MQTT_TLS_TIMEOUT_MS);
     mqttNet.setHandshakeTimeout((MQTT_TLS_TIMEOUT_MS + 999UL) / 1000UL);
+    runtimeBreadcrumb(RB_MQTT_TLS_BEGIN);
     bool ok = mqttClient.connect(
         clientId,
         mqttUser,
@@ -1918,6 +2010,7 @@ void maintainMqtt(unsigned long now) {
         true,
         "offline"
     );
+    runtimeBreadcrumb(RB_MQTT_TLS_END, ok ? 1 : 0);
     mqttLastConnectSucceeded = ok;
     mqttLastAttemptState = mqttClient.state();
     // Snapshot actual mbedTLS failure ASAP. Error 0 on a failed connect
@@ -2031,7 +2124,9 @@ bool publishMqttMeasurements() {
 // =====================================================
 // Every physical read updates health, including utility indication requests.
 bool readMeterWithHealth() {
+    runtimeBreadcrumb(RB_SENSOR_BEGIN);
     bool ok = applicationReadMeasurements();
+    runtimeBreadcrumb(RB_SENSOR_END, ok ? 1 : 0);
     if (!meterReadAttempted || ok != lastMeterReadOk) meterHealthDirty = true;
     meterReadAttempted = true; lastMeterReadOk = ok;
     if (ok) { meterHasGoodSample = true; meterLastGoodMs = millis(); }
@@ -2688,6 +2783,15 @@ String buildRecoveryReport() {
     } else {
         d += "UNAVAILABLE\n";
     }
+    d += "RTC runtime breadcrumb events (previous reset): " +
+         String(runtimeBeforeResetCount) + "\n";
+    for(uint8_t i=0;i<runtimeBeforeResetCount;++i) {
+        const RuntimeBreadcrumbEntry& b=runtimeBeforeReset[i];
+        d += "Runtime #" + String(b.sequence) + " @" + String(b.uptimeMs) +
+             "ms " + runtimeBreadcrumbLabel(b.code) +
+             " detail=" + String(b.detail) + "\n";
+    }
+    d += "Last runtime event is a clue, not proof of watchdog cause.\n";
     d += "Recovery record deletion failed=" +
          String(recoveryResetClearFailed ? "YES" : "NO") + "\n";
     d += "Recovery exit: successful OTA or /restart-normal; EN reset retains the latch\n";
@@ -3321,6 +3425,17 @@ void handleNetworkDebugPage() {
         (unsigned long)wifiConnectAttempts, WIFI_RETRY_STEPS_MS[wifiRetryStep]);
     if (n <= 0 || n >= (int)sizeof(line)) return;
     if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
+
+    if (!writeCredentialProgmem(client, PSTR("RTC runtime events from previous reset:\n"))) return;
+    for(uint8_t i=0;i<runtimeBeforeResetCount;++i) {
+        const RuntimeBreadcrumbEntry& b=runtimeBeforeReset[i];
+        n=snprintf_P(line,sizeof(line),PSTR("  #%lu @%lums %s detail=%u\n"),
+            (unsigned long)b.sequence,(unsigned long)b.uptimeMs,
+            runtimeBreadcrumbLabel(b.code),(unsigned)b.detail);
+        if(n<=0||n>=(int)sizeof(line) ||
+           !writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
+    }
+    if (!writeCredentialProgmem(client, PSTR("Last runtime event is a clue, not proof of cause.\n"))) return;
 
     if (rtcTraceBeforeResetValid) {
         n = snprintf_P(line, sizeof(line), PSTR("Previous RTC step: %s (%lu), detail=%lu\nPrevious RTC heap: %lu, largest=%lu\n"),
@@ -4722,6 +4837,7 @@ void setup() {
     // Read the SDK reset structure before any network or sensor startup.
     captureCurrentReset();
     loadRtcCrashTrace();
+    loadRtcRuntimeBreadcrumbs();
     loadOledDiagnostic();
     initializeMqttIdentity();
     const bool externalReset = (currentBootReset.reason == ESP_RST_EXT);
@@ -4872,19 +4988,26 @@ void serviceNetworkPriority(unsigned long now) {
 
     // 1. Web πρώτα, ώστε η σελίδα να απαντά όσο πιο άμεσα γίνεται.
     bootCheckpoint(CRASH_STAGE_BOOT_FIRST_WEB);
+    runtimeBreadcrumb(RB_WEB_BEGIN);
     server.handleClient();
+    runtimeBreadcrumb(RB_WEB_END);
     if (credentialRestartPending) return;
 
     // 2. MQTT αμέσως μετά: keepalive, incoming requests, reconnect.
+    runtimeBreadcrumb(RB_MQTT_BEGIN);
     maintainMqtt(now);
+    runtimeBreadcrumb(RB_MQTT_END);
 
     // 3. Δεύτερη ευκαιρία στο Web μετά από πιθανό MQTT reconnect.
+    runtimeBreadcrumb(RB_WEB_BEGIN);
     server.handleClient();
+    runtimeBreadcrumb(RB_WEB_END);
     if (credentialRestartPending) return;
 
 }
 
 void loop() {
+    runtimeBreadcrumb(RB_LOOP_BEGIN);
     unsigned long now = millis();
     if (serviceCredentialRestart(now)) return;
 
@@ -4948,18 +5071,25 @@ void loop() {
         bootCheckpoint(CRASH_STAGE_BOOT_FIRST_METER);
         lastMeterReadOk = readMeterWithHealth();
         bootCheckpoint(CRASH_STAGE_BOOT_FIRST_DISPLAY);
+        runtimeBreadcrumb(RB_OLED_BEGIN);
         applicationRenderMeasurements(lastMeterReadOk);
+        runtimeBreadcrumb(RB_OLED_END);
         bootFirstMeterDone = true;
         meterDisplayUpdated = true;
     }
     serviceFlashSetupButton(millis());
     if (credentialPortalActive || credentialPortalOnly || wifiFallbackActive) serviceCredentialPortal(millis());
-    if (serviceNetworkStackRecovery(millis())) {
+    runtimeBreadcrumb(RB_WIFI_STACK_BEGIN);
+    const bool stackRecovered=serviceNetworkStackRecovery(millis());
+    runtimeBreadcrumb(RB_WIFI_STACK_END,stackRecovered ? 1 : 0);
+    if (stackRecovered) {
         serviceOledDiagnostic(millis());
         yield();
         return;
     }
+    runtimeBreadcrumb(RB_WIFI_BEGIN);
     serviceWiFiReconnect(millis());
+    runtimeBreadcrumb(RB_WIFI_END);
 
     // =====================================================
     // Network service after the due local measurement.
@@ -5007,7 +5137,9 @@ void loop() {
     // BACKGROUND HEALTH / APPLICATION SERVICE
     // =====================================================
     serviceMeterHealth(millis());
+    runtimeBreadcrumb(RB_BACKGROUND_BEGIN);
     applicationBackground(millis());
+    runtimeBreadcrumb(RB_BACKGROUND_END);
 
     // Application-specific storage/history work runs in applicationBackground().
 
@@ -5020,7 +5152,7 @@ void loop() {
     }
     serviceWiFiStatusDisplay(millis(), meterDisplayUpdated);
     serviceOledDiagnostic(millis());
-
+    runtimeBreadcrumb(RB_LOOP_IDLE);
     yield();
 }
 
