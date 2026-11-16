@@ -953,6 +953,7 @@ const char* runtimeWebSubphaseName(uint32_t part) {
         default:return "HANDLE_CLIENT_OR_IDLE";
     }
 }
+extern WebServer server; // defined later; needed by early RTC diagnostic helpers
 uint16_t runtimeWebRouteId() {
     const String& uri=server.uri();
     if(uri=="/")return 1;
