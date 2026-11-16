@@ -10,9 +10,9 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.07"
-#define VERSION "1.07"
-#define BUILD_DATE "11/11/2026"
+#define PLATFORM_VERSION "1.08"
+#define VERSION "1.08"
+#define BUILD_DATE "16/11/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
 #define DEVICE_LABEL "ESP32-C3"
@@ -806,7 +806,11 @@ enum RuntimeEvent : uint16_t {
     RB_SENSOR_BEGIN=10, RB_SENSOR_END=11,
     RB_OLED_BEGIN=20, RB_OLED_END=21,
     RB_WIFI_BEGIN=30, RB_WIFI_END=31,
-    RB_WEB_BEGIN=40, RB_WEB_END=41,
+    RB_WEB1_BEGIN=40, RB_WEB1_END=41,
+    RB_WEB2_BEGIN=42, RB_WEB2_END=43,
+    RB_WEB_AP_BEGIN=44, RB_WEB_AP_END=45,
+    RB_HANDLER_BEGIN=46, RB_HANDLER_END=47,
+    RB_WEB_SLOW=48,
     RB_MQTT_BEGIN=50, RB_MQTT_END=51,
     RB_MQTT_DNS_BEGIN=52, RB_MQTT_DNS_END=53,
     RB_MQTT_TLS_BEGIN=54, RB_MQTT_TLS_END=55,
@@ -837,7 +841,11 @@ const char* runtimeBreadcrumbLabel(uint16_t code) {
         case RB_SENSOR_BEGIN:return "SENSOR_BEGIN"; case RB_SENSOR_END:return "SENSOR_END";
         case RB_OLED_BEGIN:return "OLED_BEGIN"; case RB_OLED_END:return "OLED_END";
         case RB_WIFI_BEGIN:return "WIFI_BEGIN"; case RB_WIFI_END:return "WIFI_END";
-        case RB_WEB_BEGIN:return "WEB_BEGIN"; case RB_WEB_END:return "WEB_END";
+        case RB_WEB1_BEGIN:return "WEB1_BEGIN"; case RB_WEB1_END:return "WEB1_END";
+        case RB_WEB2_BEGIN:return "WEB2_BEGIN"; case RB_WEB2_END:return "WEB2_END";
+        case RB_WEB_AP_BEGIN:return "WEB_AP_BEGIN"; case RB_WEB_AP_END:return "WEB_AP_END";
+        case RB_HANDLER_BEGIN:return "HANDLER_BEGIN"; case RB_HANDLER_END:return "HANDLER_END";
+        case RB_WEB_SLOW:return "WEB_SLOW_MS";
         case RB_MQTT_BEGIN:return "MQTT_BEGIN"; case RB_MQTT_END:return "MQTT_END";
         case RB_MQTT_DNS_BEGIN:return "MQTT_DNS_BEGIN"; case RB_MQTT_DNS_END:return "MQTT_DNS_END";
         case RB_MQTT_TLS_BEGIN:return "MQTT_TLS_BEGIN"; case RB_MQTT_TLS_END:return "MQTT_TLS_END";
@@ -883,6 +891,99 @@ void runtimeBreadcrumb(uint16_t code,uint16_t detail=0) {
     slot.code=b.code; slot.detail=b.detail; slot.checksum=b.checksum;
     slot.magic=RUNTIME_BREADCRUMB_MAGIC; // commit
 }
+
+
+// v1.08: sticky RTC Web phase survives an interrupt-watchdog reset.
+// The high-frequency idle loop no longer fills the 12-entry RTC event ring.
+// The phase is sampled into the ring at most once/second per Web call site.
+static const uint32_t RUNTIME_WEB_MAGIC=0x57504238UL;
+struct RuntimeWebActive {
+    uint32_t magic, phase, sinceMs, checksum;
+};
+RTC_NOINIT_ATTR static volatile RuntimeWebActive rtcRuntimeWebActive;
+RTC_NOINIT_ATTR static volatile uint32_t rtcRuntimeWebSubphase;
+RuntimeWebActive runtimePreviousWeb={};
+bool runtimePreviousWebValid=false;
+uint32_t runtimePreviousWebSubphase=0;
+uint32_t runtimeLastWebLogMs[4]={};
+uint32_t runtimeWebChecksum(uint32_t phase,uint32_t start) {
+    return RUNTIME_WEB_MAGIC ^ phase ^ start ^ 0xC38AC24DUL;
+}
+void loadRuntimeWebPhase() {
+    runtimePreviousWebValid=false;
+    runtimePreviousWebSubphase=0;
+    if(platformRtcContentsUsable()) {
+        RuntimeWebActive t={};
+        platformReadRetained(&t,&rtcRuntimeWebActive,sizeof(t));
+        if(t.magic==RUNTIME_WEB_MAGIC && t.phase>=1 && t.phase<=3 &&
+           t.checksum==runtimeWebChecksum(t.phase,t.sinceMs)) {
+            runtimePreviousWeb=t;
+            runtimePreviousWebValid=true;
+            runtimePreviousWebSubphase=rtcRuntimeWebSubphase;
+        }
+    }
+    rtcRuntimeWebActive.magic=0;
+    rtcRuntimeWebSubphase=0;
+}
+const char* runtimeWebPhaseName(uint32_t phase) {
+    switch(phase) {
+        case 1:return "WEB_PASS_1";
+        case 2:return "WEB_PASS_2";
+        case 3:return "WEB_AP_OR_RECOVERY";
+        default:return "NONE";
+    }
+}
+const char* runtimeWebSubphaseName(uint32_t part) {
+    switch(part) {
+        case 1:return "SOCKET_WRITE";
+        case 2:return "SOCKET_CLOSE";
+        default:return "HANDLE_CLIENT_OR_IDLE";
+    }
+}
+extern WebServer server; // defined later; needed by early RTC diagnostic helpers
+uint16_t runtimeWebRouteId() {
+    const String& uri=server.uri();
+    if(uri=="/")return 1;
+    if(uri=="/live")return 2;
+    if(uri=="/network-debug")return 3;
+    if(uri=="/setup")return 4;
+    if(uri=="/debug"||uri=="/debug.txt")return 5;
+    if(uri=="/charts"||uri=="/charts-data")return 6;
+    if(uri=="/restart-normal")return 7;
+    return 99; // other path, no URL or credentials stored
+}
+class RuntimeWebScope {
+public:
+    explicit RuntimeWebScope(uint8_t phase) : phase_(phase), started_(millis()) {
+        rtcRuntimeWebActive.magic=0;
+        rtcRuntimeWebActive.phase=phase_;
+        rtcRuntimeWebActive.sinceMs=started_;
+        rtcRuntimeWebActive.checksum=runtimeWebChecksum(phase_,started_);
+        rtcRuntimeWebSubphase=0;
+        rtcRuntimeWebActive.magic=RUNTIME_WEB_MAGIC; // commit last
+        // Sample completed idle polling; crash-active phase above is unsampled.
+        if(phase_<4 && (runtimeLastWebLogMs[phase_]==0 ||
+           (uint32_t)(started_-runtimeLastWebLogMs[phase_])>=1000UL)) {
+            runtimeLastWebLogMs[phase_]=started_ ? started_:1;
+            sampled_=true;
+            runtimeBreadcrumb(phase_==1?RB_WEB1_BEGIN:
+                phase_==2?RB_WEB2_BEGIN:RB_WEB_AP_BEGIN);
+        }
+    }
+    ~RuntimeWebScope() {
+        const uint32_t elapsed=(uint32_t)(millis()-started_);
+        if(sampled_) runtimeBreadcrumb(phase_==1?RB_WEB1_END:
+            phase_==2?RB_WEB2_END:RB_WEB_AP_END);
+        if(elapsed>=200) runtimeBreadcrumb(RB_WEB_SLOW,
+            (uint16_t)(elapsed>65535UL?65535UL:elapsed));
+        rtcRuntimeWebActive.magic=0;
+        rtcRuntimeWebSubphase=0;
+    }
+private:
+    uint8_t phase_;
+    uint32_t started_;
+    bool sampled_=false;
+};
 
 const char* crashStageLabel(uint32_t stage) {
     switch (stage) {
@@ -1166,7 +1267,8 @@ bool requireApWebPin() {
 void closeRootClient(WiFiClient& client, bool graceful);
 class WebResponseScope {
 public:
-    WebResponseScope() : client(server.client()) {
+    WebResponseScope() : client(server.client()), route_(runtimeWebRouteId()) {
+        runtimeBreadcrumb(RB_HANDLER_BEGIN,route_);
         webResponseStartedMs = millis();
         webResponseActive = true;
         client.setTimeout(700);
@@ -1176,9 +1278,11 @@ public:
     ~WebResponseScope() {
         if (client.connected()) closeRootClient(client, true);
         webResponseActive = false;
+        runtimeBreadcrumb(RB_HANDLER_END,route_);
     }
 private:
     WiFiClient client;
+    uint16_t route_;
 };
 
 void handleApWebLogin() {
@@ -2163,6 +2267,8 @@ bool webRootHeapHealthy(uint32_t* freeOut = nullptr,
 }
 
 void closeRootClient(WiFiClient& client, bool graceful = false) {
+    const uint32_t savedSubphase=rtcRuntimeWebSubphase;
+    rtcRuntimeWebSubphase=2;
     // Native NetworkClient::stop() closes its shared socket immediately; it
     // has no ESP8266 timeout argument. A failed response may abort queued TX.
     const int socket = client.fd();
@@ -2175,11 +2281,14 @@ void closeRootClient(WiFiClient& client, bool graceful = false) {
     if (graceful && socket >= 0) shutdown(socket, SHUT_WR);
     client.stop();
     ++webRootForcedCloseCount;
+    rtcRuntimeWebSubphase=savedSubphase;
     yield();
 }
 
 bool writeWebBytes(WiFiClient& client, const uint8_t* data, size_t length, bool emergency) {
     if (!data || !length) return true;
+    const uint32_t savedSubphase=rtcRuntimeWebSubphase;
+    rtcRuntimeWebSubphase=1;
     const size_t sliceBytes = emergency ? 32 : WEB_ROOT_RAM_SLICE_BYTES;
     const uint32_t started = millis();
     for (size_t offset = 0; offset < length;) {
@@ -2195,6 +2304,7 @@ bool writeWebBytes(WiFiClient& client, const uint8_t* data, size_t length, bool 
             maxBlock < (emergency ? 128U : WEB_ROOT_MIN_BLOCK_BYTES)) {
             ++webRootWriteAbortCount;
             closeRootClient(client, false);
+            rtcRuntimeWebSubphase=savedSubphase;
             return false;
         }
         size_t chunk = length - offset;
@@ -2211,10 +2321,12 @@ bool writeWebBytes(WiFiClient& client, const uint8_t* data, size_t length, bool 
         } else {
             ++webRootWriteAbortCount;
             closeRootClient(client, false);
+            rtcRuntimeWebSubphase=savedSubphase;
             return false;
         }
         yield();
     }
+    rtcRuntimeWebSubphase=savedSubphase;
     return true;
 }
 
@@ -2792,6 +2904,13 @@ String buildRecoveryReport() {
              " detail=" + String(b.detail) + "\n";
     }
     d += "Last runtime event is a clue, not proof of watchdog cause.\n";
+    d += "RTC Web active at reset=" + String(runtimePreviousWebValid ? "YES" : "NO") + "\n";
+    if(runtimePreviousWebValid) {
+        d += "RTC Web phase=" + String(runtimeWebPhaseName(runtimePreviousWeb.phase)) +
+             " started_ms=" + String(runtimePreviousWeb.sinceMs) +
+             " subphase=" + String(runtimeWebSubphaseName(runtimePreviousWebSubphase)) + "\n";
+    }
+    d += "Web subphase 1=write, 2=close; phase remains a clue, not proof.\n";
     d += "Recovery record deletion failed=" +
          String(recoveryResetClearFailed ? "YES" : "NO") + "\n";
     d += "Recovery exit: successful OTA or /restart-normal; EN reset retains the latch\n";
@@ -3436,6 +3555,13 @@ void handleNetworkDebugPage() {
            !writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
     }
     if (!writeCredentialProgmem(client, PSTR("Last runtime event is a clue, not proof of cause.\n"))) return;
+    n=snprintf_P(line,sizeof(line),
+        PSTR("RTC Web active at prior reset: %s phase=%s subphase=%s\n"),
+        runtimePreviousWebValid?"YES":"NO",
+        runtimePreviousWebValid?runtimeWebPhaseName(runtimePreviousWeb.phase):"NONE",
+        runtimePreviousWebValid?runtimeWebSubphaseName(runtimePreviousWebSubphase):"NONE");
+    if(n<=0||n>=(int)sizeof(line) ||
+       !writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
 
     if (rtcTraceBeforeResetValid) {
         n = snprintf_P(line, sizeof(line), PSTR("Previous RTC step: %s (%lu), detail=%lu\nPrevious RTC heap: %lu, largest=%lu\n"),
@@ -3959,7 +4085,10 @@ void serviceCredentialPortal(unsigned long now) {
         return;
     }
     credentialDns.processNextRequest();
-    server.handleClient();
+    {
+        RuntimeWebScope webScope(3);
+        server.handleClient();
+    }
 
 }
 
@@ -4010,7 +4139,10 @@ void serviceRecoveryOnly(unsigned long now) {
     }
 
     if (networkServicesStarted) {
-        if (!credentialPortalActive) server.handleClient();
+        if (!credentialPortalActive) {
+            RuntimeWebScope webScope(3);
+            server.handleClient();
+        }
         ArduinoOTA.handle();
     }
 
@@ -4838,6 +4970,7 @@ void setup() {
     captureCurrentReset();
     loadRtcCrashTrace();
     loadRtcRuntimeBreadcrumbs();
+    loadRuntimeWebPhase();
     loadOledDiagnostic();
     initializeMqttIdentity();
     const bool externalReset = (currentBootReset.reason == ESP_RST_EXT);
@@ -4988,9 +5121,10 @@ void serviceNetworkPriority(unsigned long now) {
 
     // 1. Web πρώτα, ώστε η σελίδα να απαντά όσο πιο άμεσα γίνεται.
     bootCheckpoint(CRASH_STAGE_BOOT_FIRST_WEB);
-    runtimeBreadcrumb(RB_WEB_BEGIN);
-    server.handleClient();
-    runtimeBreadcrumb(RB_WEB_END);
+    {
+        RuntimeWebScope webScope(1);
+        server.handleClient();
+    }
     if (credentialRestartPending) return;
 
     // 2. MQTT αμέσως μετά: keepalive, incoming requests, reconnect.
@@ -4999,15 +5133,15 @@ void serviceNetworkPriority(unsigned long now) {
     runtimeBreadcrumb(RB_MQTT_END);
 
     // 3. Δεύτερη ευκαιρία στο Web μετά από πιθανό MQTT reconnect.
-    runtimeBreadcrumb(RB_WEB_BEGIN);
-    server.handleClient();
-    runtimeBreadcrumb(RB_WEB_END);
+    {
+        RuntimeWebScope webScope(2);
+        server.handleClient();
+    }
     if (credentialRestartPending) return;
 
 }
 
 void loop() {
-    runtimeBreadcrumb(RB_LOOP_BEGIN);
     unsigned long now = millis();
     if (serviceCredentialRestart(now)) return;
 
@@ -5152,7 +5286,6 @@ void loop() {
     }
     serviceWiFiStatusDisplay(millis(), meterDisplayUpdated);
     serviceOledDiagnostic(millis());
-    runtimeBreadcrumb(RB_LOOP_IDLE);
     yield();
 }
 
