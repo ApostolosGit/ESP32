@@ -10,9 +10,9 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.08"
-#define VERSION "1.08"
-#define BUILD_DATE "16/11/2026"
+#define PLATFORM_VERSION "1.09"
+#define VERSION "1.09"
+#define BUILD_DATE "17/11/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
 #define DEVICE_LABEL "ESP32-C3"
@@ -819,21 +819,26 @@ enum RuntimeEvent : uint16_t {
     RB_ADMIN_BEGIN=80, RB_ADMIN_END=81,
     RB_WIFI_STACK_BEGIN=90, RB_WIFI_STACK_END=91
 };
+
 static const uint8_t RUNTIME_BREADCRUMB_CAPACITY=12;
-static const uint32_t RUNTIME_BREADCRUMB_MAGIC=0x52544231UL;
+static const uint32_t RUNTIME_BREADCRUMB_MAGIC=0x52544239UL; // v1.09 layout
 struct RuntimeBreadcrumbEntry {
-    uint32_t magic, sequence, uptimeMs;
+    uint32_t magic, sequence, bootToken;
+    uint64_t uptimeUs; // esp_timer monotonic microseconds since this boot
     uint16_t code, detail;
     uint32_t checksum;
 };
 RTC_NOINIT_ATTR static volatile RuntimeBreadcrumbEntry rtcRuntimeBreadcrumbs[RUNTIME_BREADCRUMB_CAPACITY];
-RuntimeBreadcrumbEntry runtimeBeforeReset[RUNTIME_BREADCRUMB_CAPACITY] = {};
+RuntimeBreadcrumbEntry runtimeBeforeReset[RUNTIME_BREADCRUMB_CAPACITY]={};
 uint8_t runtimeBeforeResetCount=0;
 uint32_t runtimeBreadcrumbSequence=0;
+uint32_t runtimeBootToken=0;
+bool runtimePreviousTimeOrdered=true;
 
 uint32_t runtimeBreadcrumbChecksum(const RuntimeBreadcrumbEntry& b) {
-    return RUNTIME_BREADCRUMB_MAGIC ^ b.sequence ^ b.uptimeMs ^
-           (((uint32_t)b.code << 16) | (uint32_t)b.detail) ^ 0x39AC0B5DUL;
+    return RUNTIME_BREADCRUMB_MAGIC ^ b.sequence ^ b.bootToken ^
+           (uint32_t)b.uptimeUs ^ (uint32_t)(b.uptimeUs>>32) ^
+           (((uint32_t)b.code<<16)|(uint32_t)b.detail) ^ 0x39AC0B5DUL;
 }
 const char* runtimeBreadcrumbLabel(uint16_t code) {
     switch(code) {
@@ -858,77 +863,88 @@ const char* runtimeBreadcrumbLabel(uint16_t code) {
 }
 void loadRtcRuntimeBreadcrumbs() {
     runtimeBeforeResetCount=0;
-    // A power-on/brownout does not guarantee retained RTC bytes.
-    if (platformRtcContentsUsable()) {
+    runtimePreviousTimeOrdered=true;
+    if(platformRtcContentsUsable()) {
         for(uint8_t i=0;i<RUNTIME_BREADCRUMB_CAPACITY;++i) {
             RuntimeBreadcrumbEntry b={};
             platformReadRetained(&b,&rtcRuntimeBreadcrumbs[i],sizeof(b));
             if(b.magic!=RUNTIME_BREADCRUMB_MAGIC ||
-               b.checksum!=runtimeBreadcrumbChecksum(b) || b.sequence==0) continue;
+               b.checksum!=runtimeBreadcrumbChecksum(b) || !b.sequence || !b.bootToken) continue;
             uint8_t j=runtimeBeforeResetCount++;
-            // Show oldest -> newest, without relying on RTC array positions.
             while(j>0 && (int32_t)(b.sequence-runtimeBeforeReset[j-1].sequence)<0) {
                 runtimeBeforeReset[j]=runtimeBeforeReset[j-1];
                 --j;
             }
             runtimeBeforeReset[j]=b;
         }
+        for(uint8_t i=1;i<runtimeBeforeResetCount;++i)
+            if(runtimeBeforeReset[i].bootToken!=runtimeBeforeReset[0].bootToken ||
+               runtimeBeforeReset[i].uptimeUs<runtimeBeforeReset[i-1].uptimeUs)
+                runtimePreviousTimeOrdered=false;
     }
-    // The pre-reset snapshot is now in RAM. Start a clean log for this boot.
     for(uint8_t i=0;i<RUNTIME_BREADCRUMB_CAPACITY;++i) rtcRuntimeBreadcrumbs[i].magic=0;
     runtimeBreadcrumbSequence=0;
+    runtimeBootToken=esp_random();
+    if(!runtimeBootToken) runtimeBootToken=1;
 }
 void runtimeBreadcrumb(uint16_t code,uint16_t detail=0) {
     const uint32_t seq=++runtimeBreadcrumbSequence;
     volatile RuntimeBreadcrumbEntry& slot=
         rtcRuntimeBreadcrumbs[(seq-1)%RUNTIME_BREADCRUMB_CAPACITY];
-    const uint32_t tick=millis();
     RuntimeBreadcrumbEntry b={};
-    b.sequence=seq; b.uptimeMs=tick; b.code=code; b.detail=detail;
+    b.sequence=seq;
+    b.bootToken=runtimeBootToken;
+    const int64_t usec=esp_timer_get_time();
+    b.uptimeUs=usec<0 ? 0ULL : (uint64_t)usec;
+    b.code=code; b.detail=detail;
     b.checksum=runtimeBreadcrumbChecksum(b);
-    slot.magic=0;       // invalidate any previous record
-    slot.sequence=b.sequence; slot.uptimeMs=b.uptimeMs;
-    slot.code=b.code; slot.detail=b.detail; slot.checksum=b.checksum;
-    slot.magic=RUNTIME_BREADCRUMB_MAGIC; // commit
+    slot.magic=0;
+    slot.sequence=b.sequence; slot.bootToken=b.bootToken;
+    slot.uptimeUs=b.uptimeUs; slot.code=b.code;
+    slot.detail=b.detail; slot.checksum=b.checksum;
+    slot.magic=RUNTIME_BREADCRUMB_MAGIC;
 }
 
-
-// v1.08: sticky RTC Web phase survives an interrupt-watchdog reset.
-// The high-frequency idle loop no longer fills the 12-entry RTC event ring.
-// The phase is sampled into the ring at most once/second per Web call site.
-static const uint32_t RUNTIME_WEB_MAGIC=0x57504238UL;
+// Stable per-boot RTC active-Web snapshot, independently of event ring.
+static const uint32_t RUNTIME_WEB_MAGIC=0x57504239UL; // v1.09 layout
 struct RuntimeWebActive {
-    uint32_t magic, phase, sinceMs, checksum;
+    uint32_t magic, phase, bootToken, checksum;
+    uint64_t sinceUs;
 };
 RTC_NOINIT_ATTR static volatile RuntimeWebActive rtcRuntimeWebActive;
 RTC_NOINIT_ATTR static volatile uint32_t rtcRuntimeWebSubphase;
+RTC_NOINIT_ATTR static volatile uint32_t rtcRuntimeWebRoute;
 RuntimeWebActive runtimePreviousWeb={};
 bool runtimePreviousWebValid=false;
-uint32_t runtimePreviousWebSubphase=0;
-uint32_t runtimeLastWebLogMs[4]={};
-uint32_t runtimeWebChecksum(uint32_t phase,uint32_t start) {
-    return RUNTIME_WEB_MAGIC ^ phase ^ start ^ 0xC38AC24DUL;
+uint32_t runtimePreviousWebSubphase=0, runtimePreviousWebRoute=0;
+uint64_t runtimeLastWebLogUs[4]={};
+uint32_t runtimeWebChecksum(uint32_t phase,uint32_t boot,uint64_t since) {
+    return RUNTIME_WEB_MAGIC ^ phase ^ boot ^ (uint32_t)since ^
+           (uint32_t)(since>>32) ^ 0xC38AC24DUL;
 }
 void loadRuntimeWebPhase() {
     runtimePreviousWebValid=false;
     runtimePreviousWebSubphase=0;
+    runtimePreviousWebRoute=0;
     if(platformRtcContentsUsable()) {
         RuntimeWebActive t={};
         platformReadRetained(&t,&rtcRuntimeWebActive,sizeof(t));
         if(t.magic==RUNTIME_WEB_MAGIC && t.phase>=1 && t.phase<=3 &&
-           t.checksum==runtimeWebChecksum(t.phase,t.sinceMs)) {
+           t.bootToken!=0 && t.checksum==runtimeWebChecksum(t.phase,t.bootToken,t.sinceUs)) {
             runtimePreviousWeb=t;
             runtimePreviousWebValid=true;
             runtimePreviousWebSubphase=rtcRuntimeWebSubphase;
+            runtimePreviousWebRoute=rtcRuntimeWebRoute;
         }
     }
     rtcRuntimeWebActive.magic=0;
     rtcRuntimeWebSubphase=0;
+    rtcRuntimeWebRoute=0;
 }
 const char* runtimeWebPhaseName(uint32_t phase) {
     switch(phase) {
         case 1:return "WEB_PASS_1";
-        case 2:return "WEB_PASS_2";
+        case 2:return "WEB_PASS_2_LEGACY";
         case 3:return "WEB_AP_OR_RECOVERY";
         default:return "NONE";
     }
@@ -940,7 +956,20 @@ const char* runtimeWebSubphaseName(uint32_t part) {
         default:return "HANDLE_CLIENT_OR_IDLE";
     }
 }
-extern WebServer server; // defined later; needed by early RTC diagnostic helpers
+const char* runtimeWebRouteName(uint32_t route) {
+    switch(route) {
+        case 1:return "ROOT";
+        case 2:return "LIVE";
+        case 3:return "NETWORK_DEBUG";
+        case 4:return "SETUP";
+        case 5:return "RECOVERY_DEBUG";
+        case 6:return "CHARTS";
+        case 7:return "RESTART_NORMAL";
+        case 99:return "OTHER";
+        default:return "NO_HANDLER";
+    }
+}
+extern WebServer server;
 uint16_t runtimeWebRouteId() {
     const String& uri=server.uri();
     if(uri=="/")return 1;
@@ -950,40 +979,58 @@ uint16_t runtimeWebRouteId() {
     if(uri=="/debug"||uri=="/debug.txt")return 5;
     if(uri=="/charts"||uri=="/charts-data")return 6;
     if(uri=="/restart-normal")return 7;
-    return 99; // other path, no URL or credentials stored
+    return 99;
 }
 class RuntimeWebScope {
 public:
-    explicit RuntimeWebScope(uint8_t phase) : phase_(phase), started_(millis()) {
+    explicit RuntimeWebScope(uint8_t phase) : phase_(phase) {
+        const int64_t now=esp_timer_get_time();
+        startedUs_=now<0 ? 0ULL : (uint64_t)now;
         rtcRuntimeWebActive.magic=0;
         rtcRuntimeWebActive.phase=phase_;
-        rtcRuntimeWebActive.sinceMs=started_;
-        rtcRuntimeWebActive.checksum=runtimeWebChecksum(phase_,started_);
+        rtcRuntimeWebActive.bootToken=runtimeBootToken;
+        rtcRuntimeWebActive.sinceUs=startedUs_;
+        rtcRuntimeWebActive.checksum=runtimeWebChecksum(phase_,runtimeBootToken,startedUs_);
         rtcRuntimeWebSubphase=0;
-        rtcRuntimeWebActive.magic=RUNTIME_WEB_MAGIC; // commit last
-        // Sample completed idle polling; crash-active phase above is unsampled.
-        if(phase_<4 && (runtimeLastWebLogMs[phase_]==0 ||
-           (uint32_t)(started_-runtimeLastWebLogMs[phase_])>=1000UL)) {
-            runtimeLastWebLogMs[phase_]=started_ ? started_:1;
+        rtcRuntimeWebRoute=0;
+        rtcRuntimeWebActive.magic=RUNTIME_WEB_MAGIC;
+        if(phase_<4 && (runtimeLastWebLogUs[phase_]==0 ||
+           (startedUs_>=runtimeLastWebLogUs[phase_] &&
+           startedUs_-runtimeLastWebLogUs[phase_]>=1000000ULL))) {
+            runtimeLastWebLogUs[phase_]=startedUs_?startedUs_:1;
             sampled_=true;
             runtimeBreadcrumb(phase_==1?RB_WEB1_BEGIN:
                 phase_==2?RB_WEB2_BEGIN:RB_WEB_AP_BEGIN);
         }
     }
     ~RuntimeWebScope() {
-        const uint32_t elapsed=(uint32_t)(millis()-started_);
+        const int64_t now=esp_timer_get_time();
+        const uint64_t endUs=now<0 ? 0ULL : (uint64_t)now;
         if(sampled_) runtimeBreadcrumb(phase_==1?RB_WEB1_END:
             phase_==2?RB_WEB2_END:RB_WEB_AP_END);
-        if(elapsed>=200) runtimeBreadcrumb(RB_WEB_SLOW,
-            (uint16_t)(elapsed>65535UL?65535UL:elapsed));
+        if(endUs>=startedUs_) {
+            const uint64_t elapsedMs=(endUs-startedUs_)/1000ULL;
+            // Never represent a 33-day clock jump as an ordinary 65.535s slow call.
+            if(elapsedMs>=200 && elapsedMs<=60000ULL)
+                runtimeBreadcrumb(RB_WEB_SLOW,(uint16_t)elapsedMs);
+        }
         rtcRuntimeWebActive.magic=0;
         rtcRuntimeWebSubphase=0;
+        rtcRuntimeWebRoute=0;
     }
 private:
     uint8_t phase_;
-    uint32_t started_;
+    uint64_t startedUs_=0;
     bool sampled_=false;
 };
+// Enforce at most one handleClient() call per Arduino loop, across routes.
+bool runtimeWebPolledThisLoop=false;
+void runtimeServiceWebOnce(uint8_t phase) {
+    if(runtimeWebPolledThisLoop) return;
+    runtimeWebPolledThisLoop=true;
+    RuntimeWebScope scope(phase);
+    server.handleClient();
+}
 
 const char* crashStageLabel(uint32_t stage) {
     switch (stage) {
@@ -1268,6 +1315,7 @@ void closeRootClient(WiFiClient& client, bool graceful);
 class WebResponseScope {
 public:
     WebResponseScope() : client(server.client()), route_(runtimeWebRouteId()) {
+        rtcRuntimeWebRoute=route_;
         runtimeBreadcrumb(RB_HANDLER_BEGIN,route_);
         webResponseStartedMs = millis();
         webResponseActive = true;
@@ -1279,6 +1327,7 @@ public:
         if (client.connected()) closeRootClient(client, true);
         webResponseActive = false;
         runtimeBreadcrumb(RB_HANDLER_END,route_);
+        rtcRuntimeWebRoute=0;
     }
 private:
     WiFiClient client;
@@ -2291,17 +2340,20 @@ bool writeWebBytes(WiFiClient& client, const uint8_t* data, size_t length, bool 
     rtcRuntimeWebSubphase=1;
     const size_t sliceBytes = emergency ? 32 : WEB_ROOT_RAM_SLICE_BYTES;
     const uint32_t started = millis();
+    uint32_t guardFreeHeap=ESP.getFreeHeap(),guardMaxBlock=platformMaxFreeBlock();
+    uint8_t guardFragmentation=0;
+    uint32_t guardCounter=0;
     for (size_t offset = 0; offset < length;) {
-        uint32_t freeHeap = 0, maxBlock = 0;
-        uint8_t fragmentation = 0;
-        platformGetHeapStats(&freeHeap, &maxBlock, &fragmentation);
+        // Heap sampling every eight socket slices, timeout checked each slice.
+        if((guardCounter++ & 7U)==0U)
+            platformGetHeapStats(&guardFreeHeap,&guardMaxBlock,&guardFragmentation);
         const bool expired = webResponseActive
             ? (uint32_t)(millis() - webResponseStartedMs) >= WEB_RESPONSE_BUDGET_MS
             : (uint32_t)(millis() - started) >= WEB_RESPONSE_BUDGET_MS;
         const int socket = client.fd();
         if (expired || socket < 0 || !client.connected() ||
-            freeHeap < (emergency ? 512UL : WEB_ROOT_MIN_HEAP_BYTES) ||
-            maxBlock < (emergency ? 128U : WEB_ROOT_MIN_BLOCK_BYTES)) {
+            guardFreeHeap < (emergency ? 512UL : WEB_ROOT_MIN_HEAP_BYTES) ||
+            guardMaxBlock < (emergency ? 128U : WEB_ROOT_MIN_BLOCK_BYTES)) {
             ++webRootWriteAbortCount;
             closeRootClient(client, false);
             rtcRuntimeWebSubphase=savedSubphase;
@@ -2309,7 +2361,6 @@ bool writeWebBytes(WiFiClient& client, const uint8_t* data, size_t length, bool 
         }
         size_t chunk = length - offset;
         if (chunk > sliceBytes) chunk = sliceBytes;
-        markCrashStage(CRASH_STAGE_WEB_ROOT_WRITE, freeHeap);
         // NetworkClient::write can retry select() for ten seconds. Raw
         // nonblocking socket writes keep every partial/EAGAIN retry inside
         // the common four-second budget; no flush() is used (it is a no-op).
@@ -2364,7 +2415,6 @@ bool writeRootProgmemViaRam(WiFiClient& client, PGM_P content, size_t length) {
             return false;
         }
 
-        markCrashStage(CRASH_STAGE_WEB_ROOT_RAMCOPY, freeHeap);
         memcpy_P(ramSlice, content + offset, chunk);
 
         if (!writeRootBytes(client, ramSlice, chunk)) return false;
@@ -2899,15 +2949,20 @@ String buildRecoveryReport() {
          String(runtimeBeforeResetCount) + "\n";
     for(uint8_t i=0;i<runtimeBeforeResetCount;++i) {
         const RuntimeBreadcrumbEntry& b=runtimeBeforeReset[i];
-        d += "Runtime #" + String(b.sequence) + " @" + String(b.uptimeMs) +
+        d += "Runtime boot=" + String(b.bootToken,HEX) +
+             " #" + String(b.sequence) + " @" + String((uint32_t)(b.uptimeUs/1000ULL)) +
              "ms " + runtimeBreadcrumbLabel(b.code) +
              " detail=" + String(b.detail) + "\n";
     }
+    d += "RTC runtime timestamps ordered=" + String(runtimePreviousTimeOrdered?"YES":"NO") +
+         " (64-bit esp_timer, boot-scoped)\n";
     d += "Last runtime event is a clue, not proof of watchdog cause.\n";
     d += "RTC Web active at reset=" + String(runtimePreviousWebValid ? "YES" : "NO") + "\n";
     if(runtimePreviousWebValid) {
         d += "RTC Web phase=" + String(runtimeWebPhaseName(runtimePreviousWeb.phase)) +
-             " started_ms=" + String(runtimePreviousWeb.sinceMs) +
+             " started_ms=" + String((uint32_t)(runtimePreviousWeb.sinceUs/1000ULL)) +
+             " boot=" + String(runtimePreviousWeb.bootToken,HEX) +
+             " route=" + String(runtimeWebRouteName(runtimePreviousWebRoute)) +
              " subphase=" + String(runtimeWebSubphaseName(runtimePreviousWebSubphase)) + "\n";
     }
     d += "Web subphase 1=write, 2=close; phase remains a clue, not proof.\n";
@@ -3548,17 +3603,19 @@ void handleNetworkDebugPage() {
     if (!writeCredentialProgmem(client, PSTR("RTC runtime events from previous reset:\n"))) return;
     for(uint8_t i=0;i<runtimeBeforeResetCount;++i) {
         const RuntimeBreadcrumbEntry& b=runtimeBeforeReset[i];
-        n=snprintf_P(line,sizeof(line),PSTR("  #%lu @%lums %s detail=%u\n"),
-            (unsigned long)b.sequence,(unsigned long)b.uptimeMs,
+        n=snprintf_P(line,sizeof(line),PSTR("  boot=%08lx #%lu @%lums %s detail=%u\n"),
+            (unsigned long)b.bootToken,(unsigned long)b.sequence,
+            (unsigned long)(b.uptimeUs/1000ULL),
             runtimeBreadcrumbLabel(b.code),(unsigned)b.detail);
         if(n<=0||n>=(int)sizeof(line) ||
            !writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
     }
     if (!writeCredentialProgmem(client, PSTR("Last runtime event is a clue, not proof of cause.\n"))) return;
     n=snprintf_P(line,sizeof(line),
-        PSTR("RTC Web active at prior reset: %s phase=%s subphase=%s\n"),
+        PSTR("RTC Web at prior reset: %s phase=%s route=%s subphase=%s\n"),
         runtimePreviousWebValid?"YES":"NO",
         runtimePreviousWebValid?runtimeWebPhaseName(runtimePreviousWeb.phase):"NONE",
+        runtimePreviousWebValid?runtimeWebRouteName(runtimePreviousWebRoute):"NONE",
         runtimePreviousWebValid?runtimeWebSubphaseName(runtimePreviousWebSubphase):"NONE");
     if(n<=0||n>=(int)sizeof(line) ||
        !writeRootBytes(client,reinterpret_cast<const uint8_t*>(line),(size_t)n)) return;
@@ -4085,10 +4142,7 @@ void serviceCredentialPortal(unsigned long now) {
         return;
     }
     credentialDns.processNextRequest();
-    {
-        RuntimeWebScope webScope(3);
-        server.handleClient();
-    }
+    runtimeServiceWebOnce(3);
 
 }
 
@@ -4139,10 +4193,7 @@ void serviceRecoveryOnly(unsigned long now) {
     }
 
     if (networkServicesStarted) {
-        if (!credentialPortalActive) {
-            RuntimeWebScope webScope(3);
-            server.handleClient();
-        }
+        if (!credentialPortalActive) runtimeServiceWebOnce(3);
         ArduinoOTA.handle();
     }
 
@@ -4944,7 +4995,7 @@ bool serviceRouterFirstApplication(unsigned long now) {
     if (normalMeterInitialized) return true;
     // Bring up the platform's HTTP/debug endpoints before touching peripherals.
     startNetworkServices();
-    server.handleClient();
+    runtimeServiceWebOnce(1);
     if (credentialRestartPending || forceRecoveryRestartPending) return false;
     platformInitializeDisplay();
 #if PLATFORM_LOCAL_CONTROL_APPLICATION
@@ -5121,27 +5172,18 @@ void serviceNetworkPriority(unsigned long now) {
 
     // 1. Web πρώτα, ώστε η σελίδα να απαντά όσο πιο άμεσα γίνεται.
     bootCheckpoint(CRASH_STAGE_BOOT_FIRST_WEB);
-    {
-        RuntimeWebScope webScope(1);
-        server.handleClient();
-    }
+    runtimeServiceWebOnce(1);
     if (credentialRestartPending) return;
 
     // 2. MQTT αμέσως μετά: keepalive, incoming requests, reconnect.
-    runtimeBreadcrumb(RB_MQTT_BEGIN);
     maintainMqtt(now);
-    runtimeBreadcrumb(RB_MQTT_END);
 
-    // 3. Δεύτερη ευκαιρία στο Web μετά από πιθανό MQTT reconnect.
-    {
-        RuntimeWebScope webScope(2);
-        server.handleClient();
-    }
-    if (credentialRestartPending) return;
+    // Web is already polled once per loop; do not compete with TLS/lwIP.
 
 }
 
 void loop() {
+    runtimeWebPolledThisLoop=false;
     unsigned long now = millis();
     if (serviceCredentialRestart(now)) return;
 
@@ -5213,17 +5255,14 @@ void loop() {
     }
     serviceFlashSetupButton(millis());
     if (credentialPortalActive || credentialPortalOnly || wifiFallbackActive) serviceCredentialPortal(millis());
-    runtimeBreadcrumb(RB_WIFI_STACK_BEGIN);
     const bool stackRecovered=serviceNetworkStackRecovery(millis());
-    runtimeBreadcrumb(RB_WIFI_STACK_END,stackRecovered ? 1 : 0);
+    if(stackRecovered) runtimeBreadcrumb(RB_WIFI_STACK_END,1);
     if (stackRecovered) {
         serviceOledDiagnostic(millis());
         yield();
         return;
     }
-    runtimeBreadcrumb(RB_WIFI_BEGIN);
     serviceWiFiReconnect(millis());
-    runtimeBreadcrumb(RB_WIFI_END);
 
     // =====================================================
     // Network service after the due local measurement.
@@ -5271,9 +5310,7 @@ void loop() {
     // BACKGROUND HEALTH / APPLICATION SERVICE
     // =====================================================
     serviceMeterHealth(millis());
-    runtimeBreadcrumb(RB_BACKGROUND_BEGIN);
     applicationBackground(millis());
-    runtimeBreadcrumb(RB_BACKGROUND_END);
 
     // Application-specific storage/history work runs in applicationBackground().
 
