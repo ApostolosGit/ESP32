@@ -132,6 +132,7 @@ struct RtcOledDiagnostic;
 struct DeviceCredentialRecord;
 struct RtcCrashTrace;
 struct RuntimeBreadcrumbEntry; // Arduino automatic prototype generation
+struct RtcWifiRfRecord; // Arduino automatic prototype generation
 struct RecoveryRecord;
 struct OledDiagnostic;
 enum class DisplayFont : uint8_t;
