@@ -10,9 +10,9 @@
 // BEGIN PLATFORM PROFILE
 #define PLATFORM_CUSTOM_APPLICATION 0
 #define PLATFORM_NAME "ESP32-C3-supermiini-CommonPlatoform"
-#define PLATFORM_VERSION "1.09"
-#define VERSION "1.09"
-#define BUILD_DATE "17/11/2026"
+#define PLATFORM_VERSION "1.10"
+#define VERSION "1.10"
+#define BUILD_DATE "27/11/2026"
 #define DEVICE_ID "common_c3"
 #define DEVICE_KIND "ESP32-C3"
 #define DEVICE_LABEL "ESP32-C3"
@@ -1241,6 +1241,113 @@ static portMUX_TYPE wifiEventMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool wifiDisconnectPending = false;
 static volatile uint16_t pendingWiFiDisconnectReason = 0;
 uint16_t wifiLastDisconnectReason = 0;
+
+/* Wi-Fi RF diagnostics (v1.10). Read-only: never changes power, channel or radio mode.
+ * dBm = RSSI or configured max RF limit; dBi antenna gain is not measurable here.
+ * Previous-reset RTC record is sampled at most every 30s or on state change. */
+uint32_t wifiRfDisconnectsSeen=0;
+uint16_t wifiRfLastDisconnectReason=0;
+uint32_t wifiRfLastDisconnectMs=0;
+uint32_t wifiRfConnectedSinceMs=0;
+int wifiRfMinRssi=0, wifiRfMaxRssi=0;
+uint32_t wifiRfRssiSamples=0, wifiRfLastRssiSampleMs=0;
+uint32_t wifiRfLastSnapshotMs=0;
+uint32_t wifiRfLastSnapshotStatus=0xFFFFFFFFUL;
+uint32_t wifiRfLastSnapshotReason=0xFFFFFFFFUL;
+static const uint32_t RTC_WIFI_RF_MAGIC=0x52464631UL;
+struct RtcWifiRfRecord {
+    uint32_t magic, bootToken, uptimeMs, status, radioMode, channel;
+    int32_t rssiDbm, txRequestedTenths, driverTxQuarterDbm;
+    uint32_t lastReason, disconnectCount, checksum;
+};
+RTC_NOINIT_ATTR static volatile RtcWifiRfRecord rtcWifiRfRecord;
+RtcWifiRfRecord wifiRfBeforeReset={};
+bool wifiRfBeforeResetValid=false;
+uint32_t wifiRfChecksum(const RtcWifiRfRecord& r) {
+    return RTC_WIFI_RF_MAGIC ^ r.bootToken ^ r.uptimeMs ^ r.status ^ r.radioMode ^
+           r.channel ^ (uint32_t)r.rssiDbm ^ (uint32_t)r.txRequestedTenths ^
+           (uint32_t)r.driverTxQuarterDbm ^ r.lastReason ^ r.disconnectCount ^ 0xC349B51DUL;
+}
+void loadWifiRfSnapshot() {
+    wifiRfBeforeResetValid=false;
+    if(platformRtcContentsUsable()) {
+        RtcWifiRfRecord r={};
+        platformReadRetained(&r,&rtcWifiRfRecord,sizeof(r));
+        if(r.magic==RTC_WIFI_RF_MAGIC && r.bootToken!=0 &&
+           r.checksum==wifiRfChecksum(r)) {
+            wifiRfBeforeReset=r;
+            wifiRfBeforeResetValid=true;
+        }
+    }
+    rtcWifiRfRecord.magic=0;
+}
+esp_err_t wifiRfGetDriverTxQuarterDbm(int8_t* value) {
+    if(!value) return ESP_ERR_INVALID_ARG;
+    *value=0;
+    if(WiFi.getMode()==WIFI_OFF) return ESP_ERR_WIFI_NOT_STARTED;
+    return esp_wifi_get_max_tx_power(value);
+}
+void wifiRfDriverTxText(char* out,size_t cap,esp_err_t* errOut=nullptr) {
+    int8_t power=0;
+    const esp_err_t err=wifiRfGetDriverTxQuarterDbm(&power);
+    if(errOut) *errOut=err;
+    if(!out||!cap) return;
+    if(err!=ESP_OK) {
+        snprintf(out,cap,"N/A");
+    } else {
+        const int q=(int)power;
+        snprintf(out,cap,"%d.%02d",q/4,(q%4)*25);
+    }
+}
+void wifiRfSampleIfDue(uint32_t now) {
+    if(WiFi.status()!=WL_CONNECTED) return;
+    if(wifiRfRssiSamples!=0 && (uint32_t)(now-wifiRfLastRssiSampleMs)<10000UL) return;
+    wifiRfLastRssiSampleMs=now;
+    const int rssi=(int)WiFi.RSSI();
+    if(rssi>0 || rssi<(-127)) return;
+    if(!wifiRfRssiSamples) wifiRfMinRssi=wifiRfMaxRssi=rssi;
+    else {
+        if(rssi<wifiRfMinRssi) wifiRfMinRssi=rssi;
+        if(rssi>wifiRfMaxRssi) wifiRfMaxRssi=rssi;
+    }
+    ++wifiRfRssiSamples;
+}
+void wifiRfSnapshotIfDue(uint32_t now) {
+    const uint32_t status=(uint32_t)WiFi.status();
+    const uint32_t reason=(uint32_t)wifiRfLastDisconnectReason;
+    if(wifiRfLastSnapshotStatus==status &&
+       wifiRfLastSnapshotReason==reason &&
+       (uint32_t)(now-wifiRfLastSnapshotMs)<30000UL) return;
+    wifiRfLastSnapshotMs=now;
+    wifiRfLastSnapshotStatus=status;
+    wifiRfLastSnapshotReason=reason;
+    RtcWifiRfRecord r={};
+    r.bootToken=runtimeBootToken;
+    r.uptimeMs=now;
+    r.status=status;
+    r.radioMode=(uint32_t)WiFi.getMode();
+    r.channel=status==WL_CONNECTED?(uint32_t)WiFi.channel():0;
+    r.rssiDbm=status==WL_CONNECTED?(int32_t)WiFi.RSSI():-127;
+    r.txRequestedTenths=wifiTxApplied?wifiTxTenths():-1;
+    int8_t q=0;
+    r.driverTxQuarterDbm=wifiRfGetDriverTxQuarterDbm(&q)==ESP_OK?(int32_t)q:-1;
+    r.lastReason=reason;
+    r.disconnectCount=wifiRfDisconnectsSeen;
+    r.checksum=wifiRfChecksum(r);
+    rtcWifiRfRecord.magic=0;
+    rtcWifiRfRecord.bootToken=r.bootToken;
+    rtcWifiRfRecord.uptimeMs=r.uptimeMs;
+    rtcWifiRfRecord.status=r.status;
+    rtcWifiRfRecord.radioMode=r.radioMode;
+    rtcWifiRfRecord.channel=r.channel;
+    rtcWifiRfRecord.rssiDbm=r.rssiDbm;
+    rtcWifiRfRecord.txRequestedTenths=r.txRequestedTenths;
+    rtcWifiRfRecord.driverTxQuarterDbm=r.driverTxQuarterDbm;
+    rtcWifiRfRecord.lastReason=r.lastReason;
+    rtcWifiRfRecord.disconnectCount=r.disconnectCount;
+    rtcWifiRfRecord.checksum=r.checksum;
+    rtcWifiRfRecord.magic=RTC_WIFI_RF_MAGIC;
+}
 const uint8_t FLASH_SETUP_PIN = 9; // NodeMCU BOOT GPIO9; release before reset to boot normally.
 const uint32_t FLASH_DEBOUNCE_MS = 40UL;
 const uint32_t FLASH_ACTION_COOLDOWN_MS = 750UL;
@@ -2957,6 +3064,22 @@ String buildRecoveryReport() {
     d += "RTC runtime timestamps ordered=" + String(runtimePreviousTimeOrdered?"YES":"NO") +
          " (64-bit esp_timer, boot-scoped)\n";
     d += "Last runtime event is a clue, not proof of watchdog cause.\n";
+    d += "RTC Wi-Fi RF snapshot before reset=" + String(wifiRfBeforeResetValid?"YES":"NO") + "\n";
+    if(wifiRfBeforeResetValid) {
+        const RtcWifiRfRecord& rf=wifiRfBeforeReset;
+        d += "RTC Wi-Fi status=" + String(rf.status) +
+             " radio_mode=" + String(rf.radioMode) +
+             " channel=" + String(rf.channel) +
+             " RSSI_dBm=" + (rf.rssiDbm==-127?String("N/A"):String(rf.rssiDbm)) +
+             " snapshot_uptime_s=" + String(rf.uptimeMs/1000UL) + "\n";
+        d += "RTC Wi-Fi TX requested_dBm=" +
+             (rf.txRequestedTenths<0?String("N/A"):String((float)rf.txRequestedTenths/10.0f,1)) +
+             " driver_readback_max_dBm=" +
+             (rf.driverTxQuarterDbm<0?String("N/A"):String((float)rf.driverTxQuarterDbm/4.0f,2)) +
+             " last_disconnect=" + String(rf.lastReason) +
+             " disconnect_events=" + String(rf.disconnectCount) + "\n";
+    }
+    d += "RTC Wi-Fi RF is sampled; this is not measured radiated TX power.\n";
     d += "RTC Web active at reset=" + String(runtimePreviousWebValid ? "YES" : "NO") + "\n";
     if(runtimePreviousWebValid) {
         d += "RTC Web phase=" + String(runtimeWebPhaseName(runtimePreviousWeb.phase)) +
@@ -3001,6 +3124,15 @@ String buildRecoveryReport() {
     d += "Flash configured bytes=" + String(ESP.getFlashChipSize()) + "\n";
     d += "Flash actual bytes=" + String(ESP.getFlashChipSize()) + "\n";
     d += "Wi-Fi status=" + String((int)WiFi.status()) + "\n";
+    char rfTxDriver[16];
+    esp_err_t rfTxError=ESP_OK;
+    wifiRfDriverTxText(rfTxDriver,sizeof(rfTxDriver),&rfTxError);
+    d += "Wi-Fi TX requested max dBm=" +
+         (wifiTxApplied?String((float)wifiTxTenths()/10.0f,1):String("N/A")) +
+         " driver readback max dBm=" + String(rfTxDriver) +
+         " driver_status=" + String((long)rfTxError) + "\n";
+    d += "Wi-Fi disconnect events since boot=" + String(wifiRfDisconnectsSeen) +
+         " last_reason=" + String(wifiRfLastDisconnectReason) + "\n";
     d += "Static local IP=" + WiFi.localIP().toString() + "\n";
     d += "Gateway=" + WiFi.gatewayIP().toString() + "\n";
     d += "Subnet=" + WiFi.subnetMask().toString() + "\n";
@@ -3210,6 +3342,23 @@ void handleCredentialSetupPage() {
         ".card{border:1px solid #dbe3e8;border-radius:12px;padding:14px;margin:12px 0}"
         "</style><style>body{font:22px/1.35 Arial,sans-serif;max-width:760px;margin:auto;padding:10px;color:#142431}h1,h2,small{font-size:inherit}pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere}input,button{font:inherit}</style></head><body><h2>" DEVICE_LABEL " v" VERSION " setup</h2>"))) return;
     if (!writeWifiFallbackNotice(client)) return;
+    // Read-only RF info shown also while connected to the Boiler's own AP.
+    char setupTxDriver[16],setupRssi[16],setupRfLine[355];
+    wifiRfDriverTxText(setupTxDriver,sizeof(setupTxDriver));
+    if(WiFi.status()==WL_CONNECTED) snprintf(setupRssi,sizeof(setupRssi),"%d",(int)WiFi.RSSI());
+    else snprintf(setupRssi,sizeof(setupRssi),"N/A");
+    int setupRfN=snprintf_P(setupRfLine,sizeof(setupRfLine),PSTR(
+        "<div class='card'><b>Wi-Fi RF diagnostics</b>"
+        "<p>Router RSSI: %s dBm<br>"
+        "TX requested max: %.1f dBm<br>"
+        "TX driver max (readback): %s dBm<br>"
+        "Last Wi-Fi failure: %u; observed disconnects: %lu</p>"
+        "<small>TX limit is not measured RF power; antenna gain dBi is unknown.</small></div>"),
+        setupRssi,(double)wifiTxTenths()/10.0,setupTxDriver,
+        (unsigned)wifiRfLastDisconnectReason,
+        (unsigned long)wifiRfDisconnectsSeen);
+    if(setupRfN<=0||setupRfN>=(int)sizeof(setupRfLine) ||
+       !writeRootBytes(client,reinterpret_cast<const uint8_t*>(setupRfLine),(size_t)setupRfN)) return;
     if (credentialPortalActive) {
         const String apIpText = WiFi.softAPIP().toString();
         if (!writeCredentialProgmem(client, PSTR("<p>Setup AP IP: <b>")) ||
@@ -3696,12 +3845,33 @@ void handleNetworkDebugPage() {
              "Adaptive TX hard cap: 15.0 dBm\n"
              "Preconnect scan RSSI: %d dBm (-127 = unknown)\n"
              "TX scans: %lu; set-power failures: %lu\n"
-             "Router outage policy: STA retries, no automatic AP\n"),
+             "Router outage policy: STA retries, temporary AP+STA after 3 failures\n"),
         WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
         txTenths / 10, txTenths % 10, wifiTxLastPreconnectRssi,
         (unsigned long)wifiTxScanCount, (unsigned long)wifiTxApplyFailures);
     if (n <= 0 || n >= (int)sizeof(txLine)) return;
     if (!writeRootBytes(client,reinterpret_cast<const uint8_t*>(txLine),(size_t)n)) return;
+    char rfDriver[16];
+    esp_err_t rfDriverStatus=ESP_OK;
+    wifiRfDriverTxText(rfDriver,sizeof(rfDriver),&rfDriverStatus);
+    const String bssid=WiFi.status()==WL_CONNECTED?WiFi.BSSIDstr():String("N/A");
+    char rfLine[450];
+    n=snprintf_P(rfLine,sizeof(rfLine),PSTR(
+        "Wi-Fi TX driver readback max: %s dBm (status=%ld; NOT measured RF)\n"
+        "Wi-Fi RSSI since boot: min=%d max=%d dBm; samples=%lu\n"
+        "Wi-Fi observed disconnects: %lu; last reason=%u\n"
+        "Wi-Fi current association age: %lu s (0 if disconnected)\n"
+        "Router BSSID: %s\n"
+        "dBi antenna gain / RF output power: NOT measurable in software\n"),
+        rfDriver,(long)rfDriverStatus,
+        wifiRfRssiSamples?wifiRfMinRssi:0,wifiRfRssiSamples?wifiRfMaxRssi:0,
+        (unsigned long)wifiRfRssiSamples,
+        (unsigned long)wifiRfDisconnectsSeen,(unsigned)wifiRfLastDisconnectReason,
+        WiFi.status()==WL_CONNECTED && wifiRfConnectedSinceMs?
+            (unsigned long)((uint32_t)(millis()-wifiRfConnectedSinceMs)/1000UL):0UL,
+        bssid.c_str());
+    if(n<=0||n>=(int)sizeof(rfLine) ||
+       !writeRootBytes(client,reinterpret_cast<const uint8_t*>(rfLine),(size_t)n)) return;
 
     if (WiFi.status() == WL_CONNECTED) {
         IPAddress lip = WiFi.localIP();
@@ -4322,6 +4492,9 @@ void servicePendingWiFiDisconnect() {
         (WiFi.getMode() != WIFI_STA && WiFi.getMode() != WIFI_AP_STA) ||
         reason == WIFI_REASON_AUTH_LEAVE || reason == WIFI_REASON_ASSOC_LEAVE) return;
     wifiLastDisconnectReason = reason;
+    wifiRfLastDisconnectReason=reason; // preserve last event after reconnection
+    wifiRfLastDisconnectMs=millis();
+    ++wifiRfDisconnectsSeen;
     if (wifiAttemptActive && !wifiAttemptFailedEvent) {
         wifiAttemptEventReason = reason;
         wifiAttemptFailedEvent = true;
@@ -4481,6 +4654,8 @@ bool serviceNetworkStackRecovery(unsigned long now) {
 
 void serviceWiFiReconnect(unsigned long now) {
     servicePendingWiFiDisconnect();
+    wifiRfSampleIfDue(now);
+    wifiRfSnapshotIfDue(now);
     if (credentialPortalOnly || !ssid[0]) return;
     if (wifiTxScanning) {
         serviceWifiTxPrescan(now);
@@ -4494,6 +4669,7 @@ void serviceWiFiReconnect(unsigned long now) {
             if (credentialPortalActive) return; // retry AP close next loop
         }
         if (!wifiWasConnected) {
+            wifiRfConnectedSinceMs=now;
             lastMqttReconnectMs = 0;
             mqttRetryStep = 0;
             mqttRetryDelayMs = mqttEverConnected ? MQTT_RUNTIME_RETRY_STEPS_MS[0] : MQTT_RETRY_STEPS_MS[0];
@@ -4520,6 +4696,7 @@ void serviceWiFiReconnect(unsigned long now) {
     }
     if (wifiWasConnected) {
         wifiWasConnected = false;
+        wifiRfConnectedSinceMs=0;
         mqttNet.stop();
         wifiConsecutiveFailures = 0;
         wifiAttemptActive = false;
@@ -4796,13 +4973,22 @@ bool platformWebWriteStatus(WiFiClient& client) {
         "<section class='platform-status'><p><a href='/network-debug'>Network Debug</a>"
         "<a href='/setup'>Network Setup</a></p>");
     if (!writeRootProgmemViaRam(client, links, strlen_P(links))) return false;
-    char line[256];
+    char line[460];
+    char rssi[16],txDriver[16],txRequested[16];
+    if(WiFi.status()==WL_CONNECTED) snprintf(rssi,sizeof(rssi),"%d",(int)WiFi.RSSI());
+    else snprintf(rssi,sizeof(rssi),"N/A");
+    wifiRfDriverTxText(txDriver,sizeof(txDriver));
+    if(wifiTxApplied) snprintf(txRequested,sizeof(txRequested),"%.1f",(double)wifiTxTenths()/10.0);
+    else snprintf(txRequested,sizeof(txRequested),"N/A");
     const int n = snprintf_P(line, sizeof(line),
-        PSTR("<pre>Wi-Fi: %s\nMQTT: %s\nRX RSSI: %d dBm\nTX max: %.1f dBm (configured, not measured)\nAdaptive TX cap: 15.0 dBm\nFree heap: %lu bytes</pre></section>"),
-        WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFFLINE",
-        mqttClient.connected() ? "CONNECTED" : "DISCONNECTED",
-        WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0,
-        (double)wifiTxTenths() / 10.0, (unsigned long)ESP.getFreeHeap());
+        PSTR("<pre>Wi-Fi: %s\nMQTT: %s\nRX RSSI: %s dBm\nTX requested max: %s dBm\nTX driver readback max: %s dBm\nTX hard cap: 15.0 dBm\nRSSI since boot: min=%d max=%d dBm (%lu samples)\nDisconnect events: %lu (last=%u)\nFree heap: %lu bytes</pre></section>"),
+        WiFi.status()==WL_CONNECTED?"CONNECTED":"OFFLINE",
+        mqttClient.connected()?"CONNECTED":"DISCONNECTED",
+        rssi,txRequested,txDriver,
+        wifiRfRssiSamples?wifiRfMinRssi:0,wifiRfRssiSamples?wifiRfMaxRssi:0,
+        (unsigned long)wifiRfRssiSamples,
+        (unsigned long)wifiRfDisconnectsSeen,(unsigned)wifiRfLastDisconnectReason,
+        (unsigned long)ESP.getFreeHeap());
     return n > 0 && n < (int)sizeof(line) &&
         writeRootBytes(client, reinterpret_cast<const uint8_t*>(line), (size_t)n);
 }
@@ -5022,6 +5208,7 @@ void setup() {
     loadRtcCrashTrace();
     loadRtcRuntimeBreadcrumbs();
     loadRuntimeWebPhase();
+    loadWifiRfSnapshot();
     loadOledDiagnostic();
     initializeMqttIdentity();
     const bool externalReset = (currentBootReset.reason == ESP_RST_EXT);
